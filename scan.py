@@ -35,6 +35,7 @@ BAR_SECONDS = 4 * 3600
 TP_PCT = 3.0
 SL_PCT = 9.0
 MAX_HOLD_BARS = 30
+UNIVERSE_SIZE = 30      # rule was validated on the top 30 KRW markets by 24h value
 
 
 # ------------------------------------------------------------------ http
@@ -180,9 +181,23 @@ def main():
 
     # ---- 2. scan ----
     mk = fetch(f"{BASE}/market/all?isDetails=false")
-    krw = [m['market'] for m in mk if m['market'].startswith('KRW-')
-           and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
-    print(f"Scanning {len(krw)} KRW markets on last completed bar ...")
+    krw_all = [m['market'] for m in mk if m['market'].startswith('KRW-')
+               and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
+
+    # Restrict to the universe the rule was actually validated on: the top N KRW
+    # markets by 24h traded value. The 71.6% win rate was measured on those only.
+    # Alerting on an illiquid coin outside this set would attach a win rate to a
+    # signal that was never tested there, and slippage on thin books breaks the
+    # 0.2% cost assumption the backtest ran on.
+    tickers = []
+    for i in range(0, len(krw_all), 80):
+        chunk = krw_all[i:i + 80]
+        tickers.extend(fetch(f"{BASE}/ticker?markets=" + urllib.parse.quote(','.join(chunk))))
+    tickers.sort(key=lambda t: -t['acc_trade_price_24h'])
+    krw = [t['market'] for t in tickers[:UNIVERSE_SIZE]]
+    print(f"Universe: top {len(krw)} of {len(krw_all)} KRW markets by 24h value "
+          f"(rule was validated on this set only)")
+    print(f"Scanning on last completed bar ...")
 
     hits = []
     failures = 0
