@@ -90,17 +90,33 @@ def macd_hist(c):
 
 
 # --------------------------------------------------------------- candles
-def completed_candles(market, count=200):
-    """Return 4h candles sorted oldest->newest, with the in-progress bar removed."""
-    raw = fetch(f"{BASE}/candles/minutes/240?market={market}&count={count}")
-    rows = sorted(raw, key=lambda x: x['candle_date_time_utc'])
+def completed_candles(market, need=200):
+    """Return at least `need` COMPLETED 4h candles, oldest->newest.
+
+    Upbit caps count at 200 per request, and the newest bar returned is still
+    forming -- so asking for 200 yields only 199 completed ones. MA200 needs 200,
+    hence the pagination: without it the BTC regime check silently aborts every
+    run (the workflow still reports 'success' while doing nothing)."""
     now = datetime.now(timezone.utc)
-    out = []
-    for r in rows:
-        start = datetime.fromisoformat(r['candle_date_time_utc']).replace(tzinfo=timezone.utc)
-        if (now - start).total_seconds() >= BAR_SECONDS:   # bar has fully closed
-            out.append(r)
-    return out
+    collected = {}
+    to = None
+    for _ in range(5):
+        url = f"{BASE}/candles/minutes/240?market={market}&count=200"
+        if to:
+            url += "&to=" + urllib.parse.quote(to)
+        batch = fetch(url)
+        if not batch:
+            break
+        for r in batch:
+            collected[r['candle_date_time_utc']] = r
+        to = min(batch, key=lambda x: x['candle_date_time_utc'])['candle_date_time_utc']
+        done = sum(1 for ts in collected
+                   if (now - datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)).total_seconds() >= BAR_SECONDS)
+        if done >= need:
+            break
+    rows = sorted(collected.values(), key=lambda x: x['candle_date_time_utc'])
+    return [r for r in rows
+            if (now - datetime.fromisoformat(r['candle_date_time_utc']).replace(tzinfo=timezone.utc)).total_seconds() >= BAR_SECONDS]
 
 
 def kst_str(utc_str):
@@ -143,10 +159,12 @@ def main():
     print(f"=== scan start {now_kst} KST ===")
 
     # ---- 1. regime gate ----
-    btc = completed_candles("KRW-BTC", 200)
+    btc = completed_candles("KRW-BTC", need=200)
     if len(btc) < 200:
-        print(f"BTC candles insufficient ({len(btc)}); abort quietly.")
-        return
+        # Loud, not quiet: this is a data problem, not a "no signal" outcome.
+        print(f"ERROR: only {len(btc)} completed BTC bars, need 200 for MA200.")
+        send_telegram(f"⚠️ 업비트 스캐너 오류: BTC 봉 데이터 부족({len(btc)}/200). 국면 판정 불가로 이번 회차 건너뜀.")
+        sys.exit(1)
     bc = [x['trade_price'] for x in btc]
     m200, m50 = sma(bc, 200), sma(bc, 50)
     i = len(bc) - 1
