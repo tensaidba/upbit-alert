@@ -1,12 +1,20 @@
 name: Upbit Signal Scanner
 
+# 4h candles close at 00,04,08,12,16,20 UTC (= 09,13,17,21,01,05 KST).
+# Run 6 minutes after each close so the bar is fully settled on Upbit's side.
 on:
   schedule:
+    - cron: '6 0,4,8,12,16,20 * * *'
   workflow_dispatch: {}
+
+concurrency:
+  group: upbit-scan
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,5 +22,6 @@ jobs:
           python-version: '3.11'
       - name: Run scan
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scan.py

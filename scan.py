@@ -1,176 +1,227 @@
+"""
+Upbit signal scanner -> Telegram alert.
+
+RULE (walk-forward validated, 3 years, cluster-adjusted, after 0.2% costs):
+  Entry (all three on the SAME completed 4h bar):
+    - Stochastic %K(14) crosses UP through 30
+    - MACD histogram (12,26,9) crosses UP through 0
+    - close > MA60
+  Regime gate: BTC 4h close > MA200 AND MA50 > MA200  (strong_bull only)
+  Exit: TP +3% / SL -9% / max 30 bars (5 days)
+
+  Backtest: n=67 events, win rate 71.6%, PF 1.31, expectancy +0.48%/trade, p=1.2e-5
+  KNOWN WEAKNESS: lost money in the 2024-06~2025-03 window (44.4% WR, -2.80%).
+
+IMPORTANT: only COMPLETED bars are evaluated. The in-progress bar is discarded,
+because its stochastic/MACD values still change until close -- evaluating it would
+not match the backtest and would produce signals that later vanish.
+"""
 import json
 import os
+import sys
 import time
 import urllib.request
+import urllib.parse
+from datetime import datetime, timezone, timedelta
+
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
+BASE = "https://api.upbit.com/v1"
+KST = timezone(timedelta(hours=9))
+BAR_SECONDS = 4 * 3600
+TP_PCT = 3.0
+SL_PCT = 9.0
+MAX_HOLD_BARS = 30
 
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    time.sleep(0.05)
-    return data
+# ------------------------------------------------------------------ http
+def fetch(url, retries=4):
+    last = None
+    for a in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode('utf-8'))
+            time.sleep(0.11)
+            return data
+        except Exception as e:
+            last = e
+            time.sleep(1.0 + a)
+    raise last
 
 
-def sma_series(series, period):
-    out = [None] * len(series)
-    for i in range(len(series)):
-        if i + 1 >= period:
-            out[i] = sum(series[i + 1 - period:i + 1]) / period
+# ------------------------------------------------------------ indicators
+def sma(s, p):
+    out = [None] * len(s); acc = 0.0
+    for i in range(len(s)):
+        acc += s[i]
+        if i >= p:
+            acc -= s[i - p]
+        if i + 1 >= p:
+            out[i] = acc / p
     return out
 
 
-def midpoint(high, low, period, idx):
-    if idx + 1 < period:
-        return None
-    h = max(high[idx + 1 - period:idx + 1])
-    l = min(low[idx + 1 - period:idx + 1])
-    return (h + l) / 2
+def ema(s, p):
+    out = [None] * len(s); k = 2 / (p + 1); prev = None
+    for i in range(len(s)):
+        prev = s[i] if prev is None else s[i] * k + prev * (1 - k)
+        out[i] = prev
+    return out
 
 
-def has_recent_signal(candles):
-    data = list(reversed(candles))
-    close = [d['trade_price'] for d in data]
-    high = [d['high_price'] for d in data]
-    low = [d['low_price'] for d in data]
-    vol = [d['candle_acc_trade_volume'] for d in data]
-    n = len(close)
-    if n < 100:
-        return False
-    ma10 = sma_series(close, 10); ma20 = sma_series(close, 20); ma60 = sma_series(close, 60)
-    vol_ma20 = sma_series(vol, 20)
-    tenkan = [midpoint(high, low, 9, i) for i in range(n)]
-    kijun = [midpoint(high, low, 26, i) for i in range(n)]
-    senkouA_raw = [None if a is None or b is None else (a + b) / 2 for a, b in zip(tenkan, kijun)]
-    senkouB_raw = [midpoint(high, low, 52, i) for i in range(n)]
-    senkouA = [None] * (n + 26); senkouB = [None] * (n + 26)
+def stoch_k(h, l, c, period=14):
+    n = len(c); out = [None] * n
     for i in range(n):
-        if senkouA_raw[i] is not None: senkouA[i + 26] = senkouA_raw[i]
-        if senkouB_raw[i] is not None: senkouB[i + 26] = senkouB_raw[i]
-    ma_aligned = [(ma10[i] is not None and ma20[i] is not None and ma60[i] is not None and ma10[i] > ma20[i] > ma60[i]) for i in range(n)]
+        if i + 1 >= period:
+            hh = max(h[i + 1 - period:i + 1]); ll = min(l[i + 1 - period:i + 1])
+            out[i] = 50.0 if hh == ll else (c[i] - ll) / (hh - ll) * 100
+    return out
 
-    events = {}
 
-    def add(idx, name):
-        events.setdefault(idx, set()).add(name)
+def macd_hist(c):
+    e12, e26 = ema(c, 12), ema(c, 26)
+    line = [a - b for a, b in zip(e12, e26)]
+    sig = ema(line, 9)
+    return [line[i] - sig[i] for i in range(len(c))]
 
-    for i in range(1, n):
-        if ma_aligned[i] and not ma_aligned[i - 1]:
-            add(i, "MA")
-        if i < len(senkouA) and i < len(senkouB) and senkouA[i] is not None and senkouB[i] is not None and senkouA[i - 1] is not None and senkouB[i - 1] is not None:
-            top_prev = max(senkouA[i - 1], senkouB[i - 1]); top_cur = max(senkouA[i], senkouB[i])
-            if close[i - 1] <= top_prev and close[i] > top_cur:
-                add(i, "ICHI")
-        if vol_ma20[i - 1] is not None and vol_ma20[i] is not None and vol[i - 1] <= vol_ma20[i - 1] * 2.5 and vol[i] > vol_ma20[i] * 2.5:
-            add(i, "VOL")
 
-    last_idx = n - 1
-    recent = {i: s for i, s in events.items() if i >= last_idx - 10}
-    if not recent:
+# --------------------------------------------------------------- candles
+def completed_candles(market, count=200):
+    """Return 4h candles sorted oldest->newest, with the in-progress bar removed."""
+    raw = fetch(f"{BASE}/candles/minutes/240?market={market}&count={count}")
+    rows = sorted(raw, key=lambda x: x['candle_date_time_utc'])
+    now = datetime.now(timezone.utc)
+    out = []
+    for r in rows:
+        start = datetime.fromisoformat(r['candle_date_time_utc']).replace(tzinfo=timezone.utc)
+        if (now - start).total_seconds() >= BAR_SECONDS:   # bar has fully closed
+            out.append(r)
+    return out
+
+
+def kst_str(utc_str):
+    return (datetime.fromisoformat(utc_str).replace(tzinfo=timezone.utc)
+            .astimezone(KST).strftime('%m-%d %H:%M'))
+
+
+def fmt_price(p):
+    if p >= 1000:
+        return f"{p:,.0f}"
+    if p >= 1:
+        return f"{p:,.2f}"
+    return f"{p:.6f}".rstrip('0')
+
+
+# ------------------------------------------------------------- telegram
+def send_telegram(text):
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set - would have sent:\n" + text)
         return False
-    all_sigs = set()
-    for s in recent.values():
-        all_sigs |= s
-    return len(all_sigs) >= 2
-
-
-def check_full_state(candles, momentum_bars=None):
-    data = list(reversed(candles))
-    close = [d['trade_price'] for d in data]
-    high = [d['high_price'] for d in data]
-    low = [d['low_price'] for d in data]
-    n = len(close)
-    if n < 90:
-        return None
-    ma10 = sma_series(close, 10); ma20 = sma_series(close, 20); ma60 = sma_series(close, 60)
-    tenkan = [midpoint(high, low, 9, i) for i in range(n)]
-    kijun = [midpoint(high, low, 26, i) for i in range(n)]
-    senkouA_raw = [None if a is None or b is None else (a + b) / 2 for a, b in zip(tenkan, kijun)]
-    senkouB_raw = [midpoint(high, low, 52, i) for i in range(n)]
-    senkouA = [None] * (n + 26); senkouB = [None] * (n + 26)
-    for i in range(n):
-        if senkouA_raw[i] is not None: senkouA[i + 26] = senkouA_raw[i]
-        if senkouB_raw[i] is not None: senkouB[i + 26] = senkouB_raw[i]
-    i = n - 1
-    ma_ok = ma10[i] is not None and ma20[i] is not None and ma60[i] is not None and ma10[i] > ma20[i] > ma60[i]
-    cloud_top = max(senkouA[i], senkouB[i]) if (senkouA[i] is not None and senkouB[i] is not None) else None
-    above = cloud_top is not None and close[i] > cloud_top
-    mom = None
-    if momentum_bars and n > momentum_bars:
-        mom = (close[i] - close[i - momentum_bars]) / close[i - momentum_bars] * 100
-    return {'ma_aligned': ma_ok, 'above_cloud': above, 'momentum': mom, 'price': close[i]}
-
-
-def send_slack(message):
-    webhook = os.environ.get('SLACK_WEBHOOK_URL')
-    if not webhook:
-        print("SLACK_WEBHOOK_URL not set, skipping notification. Message was:")
-        print(message)
-        return
-    payload = json.dumps({'text': message}).encode('utf-8')
-    req = urllib.request.Request(webhook, data=payload, headers={'Content-Type': 'application/json'})
+    payload = urllib.parse.urlencode({
+        'chat_id': chat_id, 'text': text, 'disable_web_page_preview': 'true'
+    }).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=payload)
     try:
-        urllib.request.urlopen(req, timeout=10)
-        print("Slack notification sent.")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            ok = json.loads(r.read().decode()).get('ok')
+        print(f"Telegram sent: {ok}")
+        return bool(ok)
     except Exception as e:
-        print(f"Slack send failed: {e}")
+        print(f"Telegram send FAILED: {e}")
+        return False
 
 
+# ------------------------------------------------------------------ main
 def main():
-    markets_data = fetch("https://api.upbit.com/v1/market/all?isDetails=false")
-    krw_markets = [m['market'] for m in markets_data if m['market'].startswith('KRW-')]
+    now_kst = datetime.now(KST).strftime('%Y-%m-%d %H:%M')
+    print(f"=== scan start {now_kst} KST ===")
 
-    candidates = []
-    for market in krw_markets:
+    # ---- 1. regime gate ----
+    btc = completed_candles("KRW-BTC", 200)
+    if len(btc) < 200:
+        print(f"BTC candles insufficient ({len(btc)}); abort quietly.")
+        return
+    bc = [x['trade_price'] for x in btc]
+    m200, m50 = sma(bc, 200), sma(bc, 50)
+    i = len(bc) - 1
+    above200 = m200[i] is not None and bc[i] > m200[i]
+    ma50_over = m50[i] is not None and m200[i] is not None and m50[i] > m200[i]
+    strong_bull = above200 and ma50_over
+    print(f"BTC bar {kst_str(btc[i]['candle_date_time_utc'])} close={bc[i]:,.0f} "
+          f"MA200={m200[i]:,.0f} MA50={m50[i]:,.0f} -> strong_bull={strong_bull}")
+
+    if not strong_bull:
+        print("Regime gate CLOSED (not strong_bull). No alert. Exiting quietly.")
+        return
+
+    # ---- 2. scan ----
+    mk = fetch(f"{BASE}/market/all?isDetails=false")
+    krw = [m['market'] for m in mk if m['market'].startswith('KRW-')
+           and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
+    print(f"Scanning {len(krw)} KRW markets on last completed bar ...")
+
+    hits = []
+    failures = 0
+    bar_ts = None
+    for mkt in krw:
         try:
-            c15 = fetch(f"https://api.upbit.com/v1/candles/minutes/15?market={market}&count=200")
-            if has_recent_signal(c15):
-                candidates.append(market)
-        except Exception:
-            pass
-
-    qualifying = []
-    for market in candidates:
-        try:
-            c30 = fetch(f"https://api.upbit.com/v1/candles/minutes/30?market={market}&count=200")
-            c4h = fetch(f"https://api.upbit.com/v1/candles/minutes/240?market={market}&count=100")
-            cday = fetch(f"https://api.upbit.com/v1/candles/days?market={market}&count=31")
-
-            s30 = check_full_state(c30)
-            s4h = check_full_state(c4h, momentum_bars=42)
-            if not s30 or not s4h:
+            c = completed_candles(mkt, 200)
+            if len(c) < 100:
                 continue
+            close = [x['trade_price'] for x in c]
+            high = [x['high_price'] for x in c]
+            low = [x['low_price'] for x in c]
+            k = stoch_k(high, low, close)
+            mh = macd_hist(close)
+            ma60 = sma(close, 60)
+            j = len(close) - 1
+            if j < 1 or ma60[j] is None or k[j] is None or k[j - 1] is None:
+                continue
+            if not (k[j - 1] < 30 <= k[j]):
+                continue
+            if not (mh[j - 1] < 0 <= mh[j]):
+                continue
+            if not (close[j] > ma60[j]):
+                continue
+            bar_ts = bar_ts or c[j]['candle_date_time_utc']
+            hits.append({
+                'market': mkt, 'price': close[j], 'k': k[j],
+                'ma60_gap': (close[j] - ma60[j]) / ma60[j] * 100,
+                'bar': c[j]['candle_date_time_utc'],
+            })
+            print(f"  SIGNAL {mkt} @ {close[j]}")
+        except Exception as e:
+            failures += 1
 
-            dday = list(reversed(cday))
-            d30 = (dday[-1]['trade_price'] - dday[0]['trade_price']) / dday[0]['trade_price'] * 100
+    print(f"Scan done: {len(hits)} signals, {failures} fetch failures")
 
-            if (s30['ma_aligned'] and s30['above_cloud'] and
-                    s4h['ma_aligned'] and s4h['above_cloud'] and
-                    s4h['momentum'] is not None and s4h['momentum'] > 0 and
-                    d30 < 70):
-                qualifying.append({
-                    'market': market,
-                    'price': s4h['price'],
-                    'momentum_7d': round(s4h['momentum'], 1),
-                    'change_30d': round(d30, 1),
-                })
-        except Exception:
-            pass
+    if not hits:
+        print("No signals this bar. No alert sent.")
+        return
 
-    qualifying.sort(key=lambda x: -x['momentum_7d'])
-    print(f"SCANNED: {len(krw_markets)} markets, {len(candidates)} candidates, {len(qualifying)} qualifying")
-
-    if qualifying:
-        tickers = [q['market'].replace('KRW-', '') for q in qualifying]
-        top = qualifying[0]
-        ticker_str = ','.join(tickers[:5]) + (f" 외{len(tickers) - 5}종" if len(tickers) > 5 else "")
-        top_ticker = top['market'].replace('KRW-', '')
-        msg = (f"🔔 [업비트 신호] {ticker_str}\n"
-               f"1위: {top_ticker} {top['price']}원, 4h 7일모멘텀 {top['momentum_7d']}%, 30일변동 {top['change_30d']}%\n"
-               f"(투자 조언 아님, 조건 충족 사실만 전달)")
-        send_slack(msg)
-    else:
-        print("No qualifying signals this run.")
+    # ---- 3. alert ----
+    hits.sort(key=lambda x: -x['ma60_gap'])
+    lines = [f"🔔 업비트 신호 {len(hits)}건  ({kst_str(hits[0]['bar'])} 봉 마감 기준)", ""]
+    for h in hits:
+        tk = h['market'].replace('KRW-', '')
+        p = h['price']
+        lines.append(f"▪ {tk}  {fmt_price(p)}원")
+        lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
+                     f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
+        lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
+    lines += [
+        "",
+        "규칙: 강세장(BTC>MA200 & MA50>MA200) + 스토캐스틱30돌파 + MACD0돌파 + 종가>MA60",
+        "백테스트 3년: 승률 71.6% (n=67), 손익비 1.31, 기대값 +0.48%/거래",
+        "⚠️ 2024-06~2025-03 구간에선 손실(-2.8%)을 낸 규칙. 조건 충족 사실 전달일 뿐 투자 조언 아님.",
+    ]
+    send_telegram("\n".join(lines))
 
 
 if __name__ == "__main__":
