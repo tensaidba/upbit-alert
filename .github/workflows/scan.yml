@@ -1,10 +1,13 @@
 name: Upbit Signal Scanner
 
-# 4h candles close at 00,04,08,12,16,20 UTC (= 09,13,17,21,01,05 KST).
-# Run 6 minutes after each close so the bar is fully settled on Upbit's side.
+# Hourly. The rule is defined on 4h bar closes, so three of every four runs find
+# nothing new by design -- they exist because GitHub's scheduled runs get delayed
+# and skipped (observed: 4 of 6 fired, up to ~3h late). Running hourly plus the
+# CATCHUP_BARS re-check in scan.py means a signal survives several missed runs;
+# sent.json keeps the overlap from re-alerting.
 on:
   schedule:
-    - cron: '6 0,4,8,12,16,20 * * *'
+    - cron: '6 * * * *'
   workflow_dispatch:
     inputs:
       test_alert:

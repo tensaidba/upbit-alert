@@ -211,19 +211,20 @@ def main():
     krw_all = [m['market'] for m in mk if m['market'].startswith('KRW-')
                and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
 
-    # Restrict to the universe the rule was actually validated on: the top N KRW
-    # markets by 24h traded value. The 71.6% win rate was measured on those only.
-    # Alerting on an illiquid coin outside this set would attach a win rate to a
-    # signal that was never tested there, and slippage on thin books breaks the
-    # 0.2% cost assumption the backtest ran on.
+    # Scan every KRW market, but remember which ones fall inside the set the rule
+    # was actually validated on (top UNIVERSE_SIZE by 24h traded value). The 71.6%
+    # win rate was measured there; outside it the rule is untested and thin books
+    # break the 0.2% cost assumption. Alerts label each hit accordingly rather than
+    # implying the same confidence everywhere.
     tickers = []
-    for i in range(0, len(krw_all), 80):
-        chunk = krw_all[i:i + 80]
+    for page in range(0, len(krw_all), 80):
+        chunk = krw_all[page:page + 80]
         tickers.extend(fetch(f"{BASE}/ticker?markets=" + urllib.parse.quote(','.join(chunk))))
     tickers.sort(key=lambda t: -t['acc_trade_price_24h'])
-    krw = [t['market'] for t in tickers[:UNIVERSE_SIZE]]
-    print(f"Universe: top {len(krw)} of {len(krw_all)} KRW markets by 24h value "
-          f"(rule was validated on this set only)")
+    validated_set = {t['market'] for t in tickers[:UNIVERSE_SIZE]}
+    krw = [t['market'] for t in tickers]
+    print(f"Universe: all {len(krw)} KRW markets "
+          f"(top {len(validated_set)} are the validated set)")
     print(f"Scanning on last completed bar ...")
 
     already_sent = load_sent()
@@ -264,7 +265,7 @@ def main():
                 hits.append({
                     'market': mkt, 'price': close[j], 'k': k[j],
                     'ma60_gap': (close[j] - ma60[j]) / ma60[j] * 100,
-                    'bar': ts,
+                    'bar': ts, 'validated': mkt in validated_set,
                 })
                 print(f"  SIGNAL {mkt} @ {close[j]} (bar {ts})")
         except Exception as e:
@@ -289,15 +290,18 @@ def main():
         return
 
     # ---- 3. alert ----
-    hits.sort(key=lambda x: (x['bar'], -x['ma60_gap']))
-    lines = [f"🔔 업비트 신호 {len(hits)}건", ""]
+    hits.sort(key=lambda x: (not x['validated'], x['bar'], -x['ma60_gap']))
+    n_val = sum(1 for h in hits if h['validated'])
+    lines = [f"🔔 업비트 신호 {len(hits)}건 (검증범위 {n_val}건 / 범위밖 {len(hits)-n_val}건)", ""]
     for h in hits:
         tk = h['market'].replace('KRW-', '')
         p = h['price']
-        lines.append(f"▪ {tk}  {fmt_price(p)}원   ({kst_str(h['bar'])} 봉)")
+        mark = "✅" if h['validated'] else "⚠️"
+        lines.append(f"{mark} {tk}  {fmt_price(p)}원   ({kst_str(h['bar'])} 봉)")
         lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
                      f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
-        lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
+        lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%"
+                     + ("" if h['validated'] else "  ← 거래대금 하위, 검증 안 된 종목"))
     lines += [
         "",
         "규칙: 강세장(BTC>MA200 & MA50>MA200) + 스토캐스틱30돌파 + MACD0돌파 + 종가>MA60",
