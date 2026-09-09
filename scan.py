@@ -35,7 +35,9 @@ BAR_SECONDS = 4 * 3600
 TP_PCT = 3.0
 SL_PCT = 9.0
 MAX_HOLD_BARS = 30
-UNIVERSE_SIZE = 30      # rule was validated on the top 30 KRW markets by 24h value
+UNIVERSE_SIZE = 30      # rule was validated on the top 30 KRW markets by traded value
+VALUE_WINDOW_DAYS = 30  # rank on a 30-day average, NOT a live 24h snapshot (see top_universe)
+MIN_HISTORY_DAYS = 67   # the backtest required >=400 4h bars of history; new listings were excluded
 TEST_ALERT = os.environ.get('TEST_ALERT', '').lower() == 'true'
 CATCHUP_BARS = 3        # re-check the last N completed bars to cover skipped runs
 SENT_FILE = 'sent.json'  # committed back to the repo so dedup survives each run
@@ -123,6 +125,59 @@ def completed_candles(market, need=200):
             if (now - datetime.fromisoformat(r['candle_date_time_utc']).replace(tzinfo=timezone.utc)).total_seconds() >= BAR_SECONDS]
 
 
+def btc_regime_by_bar(btc):
+    """strong_bull per BAR, keyed by that bar's UTC timestamp.
+
+    The catch-up window re-checks up to CATCHUP_BARS old bars, and the backtest
+    gated every entry on the regime AT THAT BAR. A single latest-bar flag applied
+    to all of them would admit entries the backtest never took -- if BTC turned
+    strong_bull only this bar, a signal from 12h ago would still pass."""
+    c = [x['trade_price'] for x in btc]
+    m200, m50 = sma(c, 200), sma(c, 50)
+    return {btc[i]['candle_date_time_utc']:
+            bool(m200[i] is not None and m50[i] is not None
+                 and c[i] > m200[i] and m50[i] > m200[i])
+            for i in range(len(btc))}
+
+
+def top_universe(markets):
+    """The top UNIVERSE_SIZE KRW markets by AVERAGE traded value over the last
+    VALUE_WINDOW_DAYS days -- deliberately not the live 24h figure.
+
+    Ranking on a 24h snapshot lets a single day's pump into the set: measured
+    2026-09-09, a 24h ranking shared only 17 of 30 names with the universe the
+    rule was validated on, so the scanner would have been alerting on a different
+    universe than the 75.9% win rate came from. A 30-day average, plus the same
+    listing-age floor the backtest used, reproduces 29 of those 30 names.
+
+    Costs ~285 daily-candle requests (about a minute) and replaces a full scan of
+    284 markets (about ten), so the run gets faster, not slower."""
+    today_kst = datetime.now(KST).strftime('%Y-%m-%d')
+    scored = []
+    too_new = failed = 0
+    for m in markets:
+        try:
+            rows = fetch(f"{BASE}/candles/days?market={m}&count={MIN_HISTORY_DAYS + 1}")
+        except Exception:
+            failed += 1                       # counted, not swallowed -- see the check in main()
+            continue
+        # Drop today's candle only if it IS today's. A market with no trades yet
+        # today simply has no partial candle, and slicing it off blindly would
+        # throw away a completed day and push the coin under the history floor.
+        if rows and rows[0]['candle_date_time_kst'][:10] == today_kst:
+            rows = rows[1:]
+        if len(rows) < MIN_HISTORY_DAYS:
+            too_new += 1                      # listed too recently to be in the backtest
+            continue
+        window = rows[:VALUE_WINDOW_DAYS]
+        scored.append((sum(r['candle_acc_trade_price'] for r in window) / len(window), m))
+    scored.sort(reverse=True)
+    print(f"Ranked {len(scored)} markets by {VALUE_WINDOW_DAYS}d average value "
+          f"({too_new} skipped: less than {MIN_HISTORY_DAYS} days listed, "
+          f"{failed} fetch failures)")
+    return [m for _, m in scored[:UNIVERSE_SIZE]], failed
+
+
 def load_sent():
     """Keys of signals already alerted, so the catch-up overlap doesn't repeat them."""
     try:
@@ -192,18 +247,19 @@ def main():
         sys.exit(1)
     bc = [x['trade_price'] for x in btc]
     m200, m50 = sma(bc, 200), sma(bc, 50)
+    regime = btc_regime_by_bar(btc)
     i = len(bc) - 1
     # Keep the bar's timestamp in its own name: `i` gets reused as a loop counter
-    # further down (ticker paging), which silently pointed this at the wrong bar.
+    # further down (the scan loop), which silently pointed this at the wrong bar.
     btc_bar = btc[i]['candle_date_time_utc']
-    above200 = m200[i] is not None and bc[i] > m200[i]
-    ma50_over = m50[i] is not None and m200[i] is not None and m50[i] > m200[i]
-    strong_bull = above200 and ma50_over
     print(f"BTC bar {kst_str(btc_bar)} close={bc[i]:,.0f} "
-          f"MA200={m200[i]:,.0f} MA50={m50[i]:,.0f} -> strong_bull={strong_bull}")
+          f"MA200={m200[i]:,.0f} MA50={m50[i]:,.0f} -> strong_bull={regime[btc_bar]}")
 
-    if not strong_bull:
-        print("Regime gate CLOSED (not strong_bull). No alert. Exiting quietly.")
+    # The gate is per-bar from here on; skip the whole run only when NONE of the
+    # bars the catch-up window can still alert on were strong_bull.
+    window = [x['candle_date_time_utc'] for x in btc[-CATCHUP_BARS:]]
+    if not any(regime.get(t) for t in window):
+        print(f"Regime gate CLOSED on all of the last {CATCHUP_BARS} bars. Exiting quietly.")
         return
 
     # ---- 2. scan ----
@@ -211,20 +267,25 @@ def main():
     krw_all = [m['market'] for m in mk if m['market'].startswith('KRW-')
                and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
 
-    # Scan every KRW market, but remember which ones fall inside the set the rule
-    # was actually validated on (top UNIVERSE_SIZE by 24h traded value). The 71.6%
-    # win rate was measured there; outside it the rule is untested and thin books
-    # break the 0.2% cost assumption. Alerts label each hit accordingly rather than
-    # implying the same confidence everywhere.
-    tickers = []
-    for page in range(0, len(krw_all), 80):
-        chunk = krw_all[page:page + 80]
-        tickers.extend(fetch(f"{BASE}/ticker?markets=" + urllib.parse.quote(','.join(chunk))))
-    tickers.sort(key=lambda t: -t['acc_trade_price_24h'])
-    validated_set = {t['market'] for t in tickers[:UNIVERSE_SIZE]}
-    krw = [t['market'] for t in tickers]
-    print(f"Universe: all {len(krw)} KRW markets "
-          f"(top {len(validated_set)} are the validated set)")
+    # Scan ONLY the universe the rule was validated on. A full-market backtest
+    # (261 markets, 3 years, same rule) showed the edge does not survive outside it:
+    #   top 30   WR 75.9%  payoff 0.42  expectancy +0.54%   <- breakeven WR is 70.4%
+    #   31-100   WR 63.3%  payoff 0.50  expectancy -0.26%
+    #   101+     WR 59.7%  payoff 0.39  expectancy -1.19%
+    #   all 261  WR 58.9%  payoff 0.42  expectancy -1.03%
+    # The payoff ratio is roughly constant across tiers -- what collapses is the win
+    # rate, and with a +3%/-9% exit the breakeven win rate is 70.4%, so only the top
+    # tier clears it. Widening the universe turns +0.54% into -1.03% per trade.
+    krw, rank_failures = top_universe(krw_all)
+    # Same principle as the BTC bar shortage above: a universe we could not build
+    # is a data failure, not a quiet 'no signal'. Without this the run would scan
+    # nothing, print 0 signals and report success.
+    if len(krw) < UNIVERSE_SIZE:
+        print(f"ERROR: ranked only {len(krw)} markets ({rank_failures} fetch failures).")
+        send_telegram(f"⚠️ 업비트 스캐너 오류: 거래대금 순위를 {len(krw)}종밖에 못 만들었습니다"
+                      f"(조회 실패 {rank_failures}건). 대상 선정 불가로 이번 회차 건너뜀.")
+        sys.exit(1)
+    print(f"Universe: top {len(krw)} of {len(krw_all)} KRW markets (the validated set)")
     print(f"Scanning on last completed bar ...")
 
     already_sent = load_sent()
@@ -257,6 +318,8 @@ def main():
                 if not (close[j] > ma60[j]):
                     continue
                 ts = c[j]['candle_date_time_utc']
+                if not regime.get(ts):
+                    continue        # BTC was not strong_bull on THAT bar
                 key = f"{mkt}@{ts}"
                 if key in already_sent:
                     print(f"  (skip, already alerted) {key}")
@@ -265,7 +328,7 @@ def main():
                 hits.append({
                     'market': mkt, 'price': close[j], 'k': k[j],
                     'ma60_gap': (close[j] - ma60[j]) / ma60[j] * 100,
-                    'bar': ts, 'validated': mkt in validated_set,
+                    'bar': ts,
                 })
                 print(f"  SIGNAL {mkt} @ {close[j]} (bar {ts})")
         except Exception as e:
@@ -280,8 +343,8 @@ def main():
             # Without this there is no way to tell "no signal" apart from "broken".
             send_telegram(
                 "🩺 진단 실행 (수동)\n\n"
-                f"BTC 국면: strong_bull ✅ (알림 조건 열림)\n"
-                f"검사 대상: 원화마켓 상위 {len(krw)}종\n"
+                f"BTC 국면: 기준봉 strong_bull={regime[btc_bar]} (봉별로 판정)\n"
+                f"검사 대상: 원화마켓 상위 {len(krw)}종 (거래대금 30일 평균)\n"
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
                 f"결과: 조건 충족 0건 → 평상시라면 알림 없음\n\n"
                 "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다.\n"
@@ -290,22 +353,21 @@ def main():
         return
 
     # ---- 3. alert ----
-    hits.sort(key=lambda x: (not x['validated'], x['bar'], -x['ma60_gap']))
-    n_val = sum(1 for h in hits if h['validated'])
-    lines = [f"🔔 업비트 신호 {len(hits)}건 (검증범위 {n_val}건 / 범위밖 {len(hits)-n_val}건)", ""]
+    hits.sort(key=lambda x: (x['bar'], -x['ma60_gap']))
+    lines = [f"🔔 업비트 신호 {len(hits)}건", ""]
     for h in hits:
         tk = h['market'].replace('KRW-', '')
         p = h['price']
-        mark = "✅" if h['validated'] else "⚠️"
-        lines.append(f"{mark} {tk}  {fmt_price(p)}원   ({kst_str(h['bar'])} 봉)")
+        lines.append(f"{tk}  {fmt_price(p)}원   ({kst_str(h['bar'])} 봉)")
         lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
                      f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
-        lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%"
-                     + ("" if h['validated'] else "  ← 거래대금 하위, 검증 안 된 종목"))
+        lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
     lines += [
         "",
         "규칙: 강세장(BTC>MA200 & MA50>MA200) + 스토캐스틱30돌파 + MACD0돌파 + 종가>MA60",
-        "백테스트 3년: 승률 71.6% (n=67), 손익비 1.31, 기대값 +0.48%/거래",
+        "대상: 거래대금 상위 30종(30일 평균) — 규칙이 검증된 범위",
+        "이 범위 3년 백테스트: 승률 75.9% (클러스터 54건), PF 1.34, 기대값 +0.54%/거래",
+        "※ 구간 분류에 현재 거래대금 순위를 과거에 소급 적용 — 순수 표본외 성적은 아님",
         "⚠️ 2024-06~2025-03 구간에선 손실(-2.8%)을 낸 규칙. 조건 충족 사실 전달일 뿐 투자 조언 아님.",
     ]
     if send_telegram("\n".join(lines)):
