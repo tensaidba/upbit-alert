@@ -36,6 +36,9 @@ TP_PCT = 3.0
 SL_PCT = 9.0
 MAX_HOLD_BARS = 30
 UNIVERSE_SIZE = 30      # rule was validated on the top 30 KRW markets by 24h value
+TEST_ALERT = os.environ.get('TEST_ALERT', '').lower() == 'true'
+CATCHUP_BARS = 3        # re-check the last N completed bars to cover skipped runs
+SENT_FILE = 'sent.json'  # committed back to the repo so dedup survives each run
 
 
 # ------------------------------------------------------------------ http
@@ -120,6 +123,27 @@ def completed_candles(market, need=200):
             if (now - datetime.fromisoformat(r['candle_date_time_utc']).replace(tzinfo=timezone.utc)).total_seconds() >= BAR_SECONDS]
 
 
+def load_sent():
+    """Keys of signals already alerted, so the catch-up overlap doesn't repeat them."""
+    try:
+        with open(SENT_FILE, encoding='utf-8') as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_sent(keys):
+    """Keep only recent keys; the file is committed back by the workflow."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        kept = sorted(k for k in keys if k.split('@', 1)[-1] >= cutoff)
+        with open(SENT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(kept, f, indent=0)
+        print(f"sent.json updated ({len(kept)} keys)")
+    except Exception as e:
+        print(f"could not write {SENT_FILE}: {e}")
+
+
 def kst_str(utc_str):
     return (datetime.fromisoformat(utc_str).replace(tzinfo=timezone.utc)
             .astimezone(KST).strftime('%m-%d %H:%M'))
@@ -169,10 +193,13 @@ def main():
     bc = [x['trade_price'] for x in btc]
     m200, m50 = sma(bc, 200), sma(bc, 50)
     i = len(bc) - 1
+    # Keep the bar's timestamp in its own name: `i` gets reused as a loop counter
+    # further down (ticker paging), which silently pointed this at the wrong bar.
+    btc_bar = btc[i]['candle_date_time_utc']
     above200 = m200[i] is not None and bc[i] > m200[i]
     ma50_over = m50[i] is not None and m200[i] is not None and m50[i] > m200[i]
     strong_bull = above200 and ma50_over
-    print(f"BTC bar {kst_str(btc[i]['candle_date_time_utc'])} close={bc[i]:,.0f} "
+    print(f"BTC bar {kst_str(btc_bar)} close={bc[i]:,.0f} "
           f"MA200={m200[i]:,.0f} MA50={m50[i]:,.0f} -> strong_bull={strong_bull}")
 
     if not strong_bull:
@@ -199,9 +226,10 @@ def main():
           f"(rule was validated on this set only)")
     print(f"Scanning on last completed bar ...")
 
+    already_sent = load_sent()
+    new_keys = []
     hits = []
     failures = 0
-    bar_ts = None
     for mkt in krw:
         try:
             c = completed_candles(mkt, 200)
@@ -213,22 +241,32 @@ def main():
             k = stoch_k(high, low, close)
             mh = macd_hist(close)
             ma60 = sma(close, 60)
-            j = len(close) - 1
-            if j < 1 or ma60[j] is None or k[j] is None or k[j - 1] is None:
-                continue
-            if not (k[j - 1] < 30 <= k[j]):
-                continue
-            if not (mh[j - 1] < 0 <= mh[j]):
-                continue
-            if not (close[j] > ma60[j]):
-                continue
-            bar_ts = bar_ts or c[j]['candle_date_time_utc']
-            hits.append({
-                'market': mkt, 'price': close[j], 'k': k[j],
-                'ma60_gap': (close[j] - ma60[j]) / ma60[j] * 100,
-                'bar': c[j]['candle_date_time_utc'],
-            })
-            print(f"  SIGNAL {mkt} @ {close[j]}")
+            # Check the last CATCHUP_BARS completed bars, not just the newest one.
+            # GitHub's scheduled runs are best-effort: they get delayed by hours and
+            # sometimes skipped entirely. A signal is fixed at its bar's close, so a
+            # skipped run would silently lose it. `already_sent` prevents the overlap
+            # from re-alerting the same signal on the next run.
+            for j in range(len(close) - CATCHUP_BARS, len(close)):
+                if j < 1 or ma60[j] is None or k[j] is None or k[j - 1] is None:
+                    continue
+                if not (k[j - 1] < 30 <= k[j]):
+                    continue
+                if not (mh[j - 1] < 0 <= mh[j]):
+                    continue
+                if not (close[j] > ma60[j]):
+                    continue
+                ts = c[j]['candle_date_time_utc']
+                key = f"{mkt}@{ts}"
+                if key in already_sent:
+                    print(f"  (skip, already alerted) {key}")
+                    continue
+                new_keys.append(key)
+                hits.append({
+                    'market': mkt, 'price': close[j], 'k': k[j],
+                    'ma60_gap': (close[j] - ma60[j]) / ma60[j] * 100,
+                    'bar': ts,
+                })
+                print(f"  SIGNAL {mkt} @ {close[j]} (bar {ts})")
         except Exception as e:
             failures += 1
 
@@ -236,15 +274,27 @@ def main():
 
     if not hits:
         print("No signals this bar. No alert sent.")
+        if TEST_ALERT:
+            # Diagnostic ping: proves the Secrets are wired even on a quiet bar.
+            # Without this there is no way to tell "no signal" apart from "broken".
+            send_telegram(
+                "🩺 진단 실행 (수동)\n\n"
+                f"BTC 국면: strong_bull ✅ (알림 조건 열림)\n"
+                f"검사 대상: 원화마켓 상위 {len(krw)}종\n"
+                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                f"결과: 조건 충족 0건 → 평상시라면 알림 없음\n\n"
+                "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다.\n"
+                "이 규칙은 연 22건(2~3주에 1회) 수준이라 조용한 날이 대부분입니다."
+            )
         return
 
     # ---- 3. alert ----
-    hits.sort(key=lambda x: -x['ma60_gap'])
-    lines = [f"🔔 업비트 신호 {len(hits)}건  ({kst_str(hits[0]['bar'])} 봉 마감 기준)", ""]
+    hits.sort(key=lambda x: (x['bar'], -x['ma60_gap']))
+    lines = [f"🔔 업비트 신호 {len(hits)}건", ""]
     for h in hits:
         tk = h['market'].replace('KRW-', '')
         p = h['price']
-        lines.append(f"▪ {tk}  {fmt_price(p)}원")
+        lines.append(f"▪ {tk}  {fmt_price(p)}원   ({kst_str(h['bar'])} 봉)")
         lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
                      f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
         lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
@@ -254,7 +304,10 @@ def main():
         "백테스트 3년: 승률 71.6% (n=67), 손익비 1.31, 기대값 +0.48%/거래",
         "⚠️ 2024-06~2025-03 구간에선 손실(-2.8%)을 낸 규칙. 조건 충족 사실 전달일 뿐 투자 조언 아님.",
     ]
-    send_telegram("\n".join(lines))
+    if send_telegram("\n".join(lines)):
+        save_sent(already_sent | set(new_keys))
+    else:
+        print("Telegram failed - NOT marking these signals as sent, so the next run retries.")
 
 
 if __name__ == "__main__":

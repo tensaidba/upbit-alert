@@ -5,11 +5,19 @@ name: Upbit Signal Scanner
 on:
   schedule:
     - cron: '6 0,4,8,12,16,20 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: '진단: 신호가 없어도 텔레그램으로 스캔 결과를 보냅니다 (Secret 연결 확인용)'
+        type: boolean
+        default: false
 
 concurrency:
   group: upbit-scan
   cancel-in-progress: false
+
+permissions:
+  contents: write   # to commit sent.json back
 
 jobs:
   scan:
@@ -24,4 +32,19 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_ALERT: ${{ inputs.test_alert }}
         run: python scan.py
+
+      # Persist the dedup ledger so the catch-up window doesn't re-alert.
+      - name: Persist sent ledger
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain sent.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add sent.json
+            git commit -m "chore: update alert ledger [skip ci]"
+            git push
+          else
+            echo "sent.json unchanged"
+          fi
