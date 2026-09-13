@@ -38,16 +38,18 @@ jobs:
           TEST_ALERT: ${{ inputs.test_alert }}
         run: python scan.py
 
-      # Persist the dedup ledger so the catch-up window doesn't re-alert.
-      - name: Persist sent ledger
+      # Persist the dedup ledger and the daily-report date. Without heartbeat.json
+      # surviving the run, daily_report_due() is true again on the next run and the
+      # status report goes out every hour instead of once a day.
+      - name: Persist ledgers
         if: always()
         run: |
-          if [[ -n "$(git status --porcelain sent.json)" ]]; then
+          if [[ -n "$(git status --porcelain sent.json heartbeat.json)" ]]; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add sent.json
+            git add sent.json heartbeat.json
             git commit -m "chore: update alert ledger [skip ci]"
             git push
           else
-            echo "sent.json unchanged"
+            echo "ledgers unchanged"
           fi

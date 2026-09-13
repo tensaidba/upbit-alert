@@ -41,6 +41,8 @@ MIN_HISTORY_DAYS = 67   # the backtest required >=400 4h bars of history; new li
 TEST_ALERT = os.environ.get('TEST_ALERT', '').lower() == 'true'
 CATCHUP_BARS = 3        # re-check the last N completed bars to cover skipped runs
 SENT_FILE = 'sent.json'  # committed back to the repo so dedup survives each run
+HEARTBEAT_FILE = 'heartbeat.json'  # last date the daily status report was sent (KST)
+DAILY_REPORT_HOUR = 9   # KST hour from which the day's status report may go out
 
 
 # ------------------------------------------------------------------ http
@@ -199,6 +201,34 @@ def save_sent(keys):
         print(f"could not write {SENT_FILE}: {e}")
 
 
+def daily_report_due():
+    """True once per KST day, on the first run at or after DAILY_REPORT_HOUR.
+
+    Tracked in a committed file rather than its own daily cron on purpose:
+    GitHub skips most scheduled runs (observed 2026-09-13: 7 fired out of 24),
+    so a once-a-day cron would simply not fire on many days -- which is exactly
+    the silence this report exists to rule out."""
+    now = datetime.now(KST)
+    if now.hour < DAILY_REPORT_HOUR:
+        return False
+    try:
+        with open(HEARTBEAT_FILE, encoding='utf-8') as f:
+            last = json.load(f).get('date')
+    except Exception:
+        last = None
+    return last != now.strftime('%Y-%m-%d')
+
+
+def mark_daily_report():
+    """Record today, so the report goes out once and not on every later run."""
+    try:
+        with open(HEARTBEAT_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'date': datetime.now(KST).strftime('%Y-%m-%d')}, f)
+        print('heartbeat.json updated')
+    except Exception as e:
+        print(f'could not write {HEARTBEAT_FILE}: {e}')
+
+
 def kst_str(utc_str):
     return (datetime.fromisoformat(utc_str).replace(tzinfo=timezone.utc)
             .astimezone(KST).strftime('%m-%d %H:%M'))
@@ -260,6 +290,17 @@ def main():
     window = [x['candle_date_time_utc'] for x in btc[-CATCHUP_BARS:]]
     if not any(regime.get(t) for t in window):
         print(f"Regime gate CLOSED on all of the last {CATCHUP_BARS} bars. Exiting quietly.")
+        # Report once a day even here: a closed gate is a normal, common state, and
+        # the point of the report is that silence never has to be interpreted.
+        if daily_report_due():
+            if send_telegram(
+                "📋 업비트 스캐너 일일 점검\n\n"
+                "BTC 국면: strong_bull 아님 → 알림 조건 닫힘\n"
+                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                "결과: 국면 필터에서 막혀 종목 스캔 안 함\n\n"
+                "이 메시지가 보이면 알림 경로는 정상입니다.\n"
+                "규칙상 BTC가 강세장일 때만 신호를 찾습니다."):
+                mark_daily_report()
         return
 
     # ---- 2. scan ----
@@ -292,6 +333,8 @@ def main():
     new_keys = []
     hits = []
     failures = 0
+    checked = 0
+    near = {'stoch': 0, 'macd': 0, 'both': 0}   # for the daily report
     for mkt in krw:
         try:
             c = completed_candles(mkt, 200)
@@ -311,11 +354,14 @@ def main():
             for j in range(len(close) - CATCHUP_BARS, len(close)):
                 if j < 1 or ma60[j] is None or k[j] is None or k[j - 1] is None:
                     continue
-                if not (k[j - 1] < 30 <= k[j]):
-                    continue
-                if not (mh[j - 1] < 0 <= mh[j]):
-                    continue
-                if not (close[j] > ma60[j]):
+                checked += 1
+                c1 = k[j - 1] < 30 <= k[j]
+                c2 = mh[j - 1] < 0 <= mh[j]
+                c3 = close[j] > ma60[j]
+                near['stoch'] += c1
+                near['macd'] += c2
+                near['both'] += c1 and c2
+                if not (c1 and c2 and c3):
                     continue
                 ts = c[j]['candle_date_time_utc']
                 if not regime.get(ts):
@@ -338,6 +384,20 @@ def main():
 
     if not hits:
         print("No signals this bar. No alert sent.")
+        if daily_report_due():
+            if send_telegram(
+                "📋 업비트 스캐너 일일 점검\n\n"
+                "BTC 국면: strong_bull ✅ (알림 조건 열림)\n"
+                f"검사 대상: 거래대금 상위 {len(krw)}종\n"
+                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                "결과: 조건 충족 0건\n\n"
+                f"근접 상황 (최근 {CATCHUP_BARS}봉 · {checked}개 조합)\n"
+                f"  스토캐스틱 30돌파 {near['stoch']}건\n"
+                f"  MACD 0돌파 {near['macd']}건\n"
+                f"  둘 다 같은 봉 {near['both']}건 ← 여기가 0이면 신호 없음\n\n"
+                "이 메시지가 보이면 알림 경로가 정상입니다.\n"
+                "신호는 2~3주에 1회 수준이라 조용한 날이 대부분입니다."):
+                mark_daily_report()
         if TEST_ALERT:
             # Diagnostic ping: proves the Secrets are wired even on a quiet bar.
             # Without this there is no way to tell "no signal" apart from "broken".
@@ -372,6 +432,9 @@ def main():
     ]
     if send_telegram("\n".join(lines)):
         save_sent(already_sent | set(new_keys))
+        # A real alert already proves the channel works, so skip today's report.
+        if daily_report_due():
+            mark_daily_report()
     else:
         print("Telegram failed - NOT marking these signals as sent, so the next run retries.")
 
