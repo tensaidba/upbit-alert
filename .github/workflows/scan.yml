@@ -34,19 +34,26 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    # Scanning every KRW market (not just the top 30) is ~800 Upbit requests: the
-    # daily-candle ranking pass plus two paginated 4h pulls per market. On the runner
-    # that measured ~1s per round trip, so a run lands around 13-15 min against the
-    # 5m31s the top-30-only version took. 25 left too little headroom for a slow API
-    # day -- a timeout kills the run mid-scan and the signal is silently lost until
-    # the next hour's catch-up.
-    timeout-minutes: 45
+    # One job stays alive for ~5.5h and scans on every hour boundary, instead of
+    # one scan per scheduled run. GitHub's scheduler is best-effort -- a single
+    # cron fired 5-7 times a DAY (measured 2026-09-13..25), so signals sat unsent
+    # for hours -- and it cannot be made reliable. This inverts the dependency:
+    # the scheduler only has to START a session, and the session itself supplies
+    # the hourly cadence. The concurrency group keeps one run active and one
+    # queued, so the moment a session ends the queued one takes over; as long as
+    # a cron fires once per 5.5h window (they average one per 3.4-4.8h) the chain
+    # does not break. A scan is ~10 min, so the job idles most of each hour.
+    timeout-minutes: 350   # must exceed the 5.5h session; GitHub caps a job at 6h
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the loop rebases before each push, and a shallow clone
+          # cannot rebase onto commits it never fetched.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Run scan
+      - name: Hourly scan session
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -55,7 +62,41 @@ jobs:
           # fire. Set repo variable PING_EVERY_RUN to 'false' to stop it without a
           # commit (Settings -> Secrets and variables -> Actions -> Variables).
           PING_EVERY_RUN: ${{ vars.PING_EVERY_RUN || 'true' }}
-        run: python scan.py
+        run: |
+          set +e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          SESSION_END=$(( $(date +%s) + 5*3600 + 1800 ))
+          while :; do
+            echo "::group::scan at $(date -u +%H:%M) UTC"
+            python scan.py
+            echo "scan.py exit=$?"
+            echo "::endgroup::"
+
+            # Persist inside the loop, not once at the end: a session lasting hours
+            # would otherwise hold the dedup ledger in memory, and a crash or the
+            # 6h cap would lose every signal it had already alerted -- which the
+            # next session would then alert again.
+            if [[ -n "$(git status --porcelain sent.json heartbeat.json ranking.json)" ]]; then
+              git add sent.json heartbeat.json ranking.json
+              git commit -q -m "chore: update alert ledger [skip ci]"
+              # A local run on the user's PC pushes the same ledgers, so rebase
+              # before pushing or the two paths fork the dedup history.
+              git pull --rebase -q && git push -q && echo "ledgers pushed" || echo "ledger push FAILED"
+            else
+              echo "ledgers unchanged"
+            fi
+
+            # Wake at :06 past the next hour, matching the cron minute.
+            NOW=$(date +%s)
+            NEXT=$(( NOW - NOW % 3600 + 3600 + 360 ))
+            if [[ $NEXT -ge $SESSION_END ]]; then
+              echo "session window over; exiting so the queued run takes the next hour"
+              break
+            fi
+            echo "sleeping $(( NEXT - NOW ))s until $(date -u -d @$NEXT +%H:%M) UTC"
+            sleep $(( NEXT - NOW ))
+          done
 
       # Persist the dedup ledger and the daily-report date. Without heartbeat.json
       # surviving the run, daily_report_due() is true again on the next run and the
