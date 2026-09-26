@@ -340,7 +340,7 @@ def send_telegram(text):
         return False
 
 
-def send_run_ping(btc_bar, regime_ok, scanned, near, cached):
+def send_run_ping(btc_bar, regime_ok, scanned, near, cached, funnel='', regime_status=''):
     """TEMPORARY per-run confirmation (see PING_EVERY_RUN).
 
     Deliberately carries the run's own clock time: the point is to show WHICH hours
@@ -351,9 +351,10 @@ def send_run_ping(btc_bar, regime_ok, scanned, near, cached):
         return False
     now = datetime.now(KST)
     if regime_ok:
-        body = (f"검사 대상: {scanned}종{' (순위 캐시)' if cached else ' (순위 재계산)'}\n"
+        body = (f"BTC 국면: {regime_status}\n"
+                f"검사 대상: {scanned}종{' (순위 캐시)' if cached else ' (순위 재계산)'}\n"
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
-                f"결과: 조건 충족 0건\n"
+                f"{funnel}\n"
                 f"  스토캐스틱 30돌파 {near['stoch']}건 / MACD 0돌파 {near['macd']}건 / "
                 f"둘 다 같은 봉 {near['both']}건")
     else:
@@ -446,11 +447,18 @@ def main():
     hits = []
     failures = 0
     checked = 0
+    insufficient = 0
+    # Funnel counters. "0 signals" has several very different causes -- nothing
+    # matched, something matched but BTC was not strong_bull on that bar, or it
+    # matched and was already alerted -- and collapsing them into one number is
+    # what made an earlier silent failure look like a normal quiet day.
+    raw_matches = regime_matches = duplicates = 0
     near = {'stoch': 0, 'macd': 0, 'both': 0}   # for the daily report
     for rank, mkt in ranked:
         try:
             c = completed_candles(mkt, 200)
             if len(c) < 100:
+                insufficient += 1
                 continue
             close = [x['trade_price'] for x in c]
             high = [x['high_price'] for x in c]
@@ -475,11 +483,14 @@ def main():
                 near['both'] += c1 and c2
                 if not (c1 and c2 and c3):
                     continue
+                raw_matches += 1
                 ts = c[j]['candle_date_time_utc']
                 if not regime.get(ts):
                     continue        # BTC was not strong_bull on THAT bar
+                regime_matches += 1
                 key = f"{mkt}@{ts}"
                 if key in already_sent:
+                    duplicates += 1
                     print(f"  (skip, already alerted) {key}")
                     continue
                 new_keys.append(key)
@@ -495,20 +506,45 @@ def main():
 
     print(f"Scan done: {len(hits)} signals, {failures} fetch failures")
 
+    funnel = (f"조건 충족 {raw_matches}건 → BTC 필터 통과 {regime_matches}건 → "
+              f"기발송 제외 {duplicates}건 → 신규 {len(hits)}건\n"
+              f"조회 실패 {failures}종 / 이력 부족 {insufficient}종 / 순위 실패 {rank_failures}건")
+    print(funnel)
+
+    # A scan that evaluated NOTHING is a data failure, not a quiet day. Without this
+    # the run prints "0 signals", exits 0 and the workflow goes green -- the same
+    # pattern as the MA200 shortage and the empty-universe bug before it.
+    if checked == 0:
+        print("ERROR: no evaluable market bars; cannot conclude 'no signal'.")
+        send_telegram("⚠️ 업비트 스캐너: 검사 가능한 종목 봉이 0개라 신호 유무를 "
+                      "판정할 수 없습니다.\n\n" + funnel)
+        sys.exit(1)
+
+    # The gate opens if ANY of the last CATCHUP_BARS bars was strong_bull, so the
+    # newest bar can be non-bull while the run still scans. Saying "strong_bull ✅"
+    # in that case is simply false.
+    latest_bull = regime[btc_bar]
+    regime_status = ("strong_bull ✅ (알림 조건 열림)" if latest_bull else
+                     "기준봉은 strong_bull 아님 · 최근 검사봉 중 강세장이 있어 스캔함")
+    incomplete = bool(failures or insufficient or rank_failures)
+    result_status = ("검사 불완전 · 조회 성공 범위에서 신규 0건" if incomplete else
+                     "검사 완료 · 신규 0건")
+
     if not hits:
-        print("No signals this bar. No alert sent.")
-        if send_run_ping(btc_bar, True, len(ranked), near, not ranking_fresh):
+        print(result_status)
+        if send_run_ping(btc_bar, True, len(ranked), near, not ranking_fresh,
+                         funnel, regime_status):
             if daily_report_due():
                 mark_daily_report()
             return
         if daily_report_due():
             if send_telegram(
                 "📋 업비트 스캐너 일일 점검\n\n"
-                "BTC 국면: strong_bull ✅ (알림 조건 열림)\n"
+                f"BTC 국면: {regime_status}\n"
                 f"검사 대상: 원화마켓 {len(ranked)}종 전체 "
                 f"(상위 {UNIVERSE_SIZE}종만 🔔 검증된 신호)\n"
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
-                "결과: 조건 충족 0건\n\n"
+                f"결과: {result_status}\n{funnel}\n\n"
                 f"근접 상황 (최근 {CATCHUP_BARS}봉 · {checked}개 조합)\n"
                 f"  스토캐스틱 30돌파 {near['stoch']}건\n"
                 f"  MACD 0돌파 {near['macd']}건\n"
@@ -526,13 +562,13 @@ def main():
                 f"  🔔 검증된 신호: 상위 {UNIVERSE_SIZE}종\n"
                 f"  🔎 참고용: {UNIVERSE_SIZE + 1}위 이하\n"
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
-                f"결과: 조건 충족 0건 → 평상시라면 알림 없음\n\n"
+                f"결과: {result_status}\n{funnel}\n\n"
                 "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다."
             )
         return
 
     # ---- 3. alert ----
-    if send_telegram(build_alert(hits)):
+    if send_telegram(build_alert(hits, funnel if incomplete or duplicates else '')):
         save_sent(already_sent | set(new_keys))
         # A real alert already proves the channel works, so skip today's report.
         if daily_report_due():
@@ -541,9 +577,12 @@ def main():
         print("Telegram failed - NOT marking these signals as sent, so the next run retries.")
 
 
-def build_alert(hits):
+def build_alert(hits, funnel=''):
     """Render the alert text. Separate from main() so the layout can be checked
-    without hitting the network or sending anything."""
+    without hitting the network or sending anything.
+
+    `funnel` is appended only when the scan was incomplete or suppressed duplicates,
+    so a normal alert stays clean but a partial one never looks complete."""
     # Two tiers, deliberately not interleaved. The same three conditions fired for
     # every name here, but only the top tier's win rate clears the +3%/-9% breakeven,
     # so mixing them into one list would lend the unvalidated ones a 75.9% that was
@@ -596,6 +635,8 @@ def build_alert(hits):
         "※ 구간 분류에 현재 거래대금 순위를 과거에 소급 적용 — 순수 표본외 성적은 아님",
         "⚠️ 2024-06~2025-03 구간에선 상위 30종도 손실(-2.8%). 조건 충족 사실 전달일 뿐 투자 조언 아님.",
     ]
+    if funnel:
+        lines += ["", funnel]
     return "\n".join(lines)
 
 
