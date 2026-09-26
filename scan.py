@@ -9,8 +9,15 @@ RULE (walk-forward validated, 3 years, cluster-adjusted, after 0.2% costs):
   Regime gate: BTC 4h close > MA200 AND MA50 > MA200  (strong_bull only)
   Exit: TP +3% / SL -9% / max 30 bars (5 days)
 
-  Backtest: n=67 events, win rate 71.6%, PF 1.31, expectancy +0.48%/trade, p=1.2e-5
-  KNOWN WEAKNESS: lost money in the 2024-06~2025-03 window (44.4% WR, -2.80%).
+SCOPE: every eligible KRW market is scanned, but signals are reported in two tiers,
+  because the edge is confined to the top of the liquidity ranking (see tier_of):
+    top 30  -> 🔔 validated    WR 75.9%, expectancy +0.54%  (breakeven WR 70.2%)
+    31+     -> 🔎 reference    WR 59.7-63.3%, expectancy negative
+  The unvalidated ones are shown because the user asked to see them, and labelled
+  because acting on them the same way is what the backtest says loses money.
+
+  Backtest (top 30): n=54 events, WR 75.9%, PF 1.34, expectancy +0.54%/trade.
+  KNOWN WEAKNESS: lost money in the 2024-06~2025-03 window (50.0% WR, -2.84%).
 
 IMPORTANT: only COMPLETED bars are evaluated. The in-progress bar is discarded,
 because its stochastic/MACD values still change until close -- evaluating it would
@@ -36,12 +43,21 @@ TP_PCT = 3.0
 SL_PCT = 9.0
 MAX_HOLD_BARS = 30
 UNIVERSE_SIZE = 30      # rule was validated on the top 30 KRW markets by traded value
-VALUE_WINDOW_DAYS = 30  # rank on a 30-day average, NOT a live 24h snapshot (see top_universe)
+MIN_RANKED = 100        # fewer than this many ranked markets means the data pull broke
+VALUE_WINDOW_DAYS = 30  # rank on a 30-day average, NOT a live 24h snapshot (see ranked_markets)
+MAX_REFERENCE_LINES = 12  # a market-wide turn can fire dozens of unvalidated signals at once
+                          # and Telegram caps a message at 4096 chars; the rest are counted, not listed.
 MIN_HISTORY_DAYS = 67   # the backtest required >=400 4h bars of history; new listings were excluded
 TEST_ALERT = os.environ.get('TEST_ALERT', '').lower() == 'true'
+# TEMPORARY: send a short confirmation on EVERY run, so the real schedule is visible
+# instead of inferred. GitHub fires only 5-7 of 24 hourly schedules (measured
+# 2026-09-13..25), and the daily report cannot show which hours were skipped.
+# Turn off by setting the repo variable PING_EVERY_RUN to 'false'.
+PING_EVERY_RUN = os.environ.get('PING_EVERY_RUN', 'false').lower() == 'true'
 CATCHUP_BARS = 3        # re-check the last N completed bars to cover skipped runs
 SENT_FILE = 'sent.json'  # committed back to the repo so dedup survives each run
 HEARTBEAT_FILE = 'heartbeat.json'  # last date the daily status report was sent (KST)
+RANKING_FILE = 'ranking.json'  # cached liquidity ranking, recomputed once per KST day
 DAILY_REPORT_HOUR = 9   # KST hour from which the day's status report may go out
 
 
@@ -142,8 +158,30 @@ def btc_regime_by_bar(btc):
             for i in range(len(btc))}
 
 
-def top_universe(markets):
-    """The top UNIVERSE_SIZE KRW markets by AVERAGE traded value over the last
+TIERS = (
+    # (rank_max, icon, label, win_rate, profit_factor, expectancy, breakeven_wr)
+    (UNIVERSE_SIZE, '🔔', '검증된 신호', 75.9, 1.34, +0.54, 70.2),
+    (100,           '🔎', '참고용 (미검증)', 63.3, 0.87, -0.26, 66.6),
+    (10 ** 9,       '🔎', '참고용 (미검증)', 59.7, 0.57, -1.19, 72.0),
+)
+
+
+def tier_of(rank):
+    """Which liquidity tier a rank falls in. Tier 0 is the only validated one.
+
+    Measured 2026-09-09 over all 261 KRW markets, 3 years, same rule and exit:
+    the payoff ratio barely moves across tiers (0.39-0.50) -- what collapses is
+    the win rate, 75.9% -> 59.7%. With a +3%/-9% exit the breakeven win rate is
+    ~70%, so only the top tier clears it. That is why tier 1 and 2 signals go out
+    labelled as unvalidated instead of as 🔔 signals."""
+    for t, spec in enumerate(TIERS):
+        if rank <= spec[0]:
+            return t
+    return len(TIERS) - 1
+
+
+def ranked_markets(markets):
+    """Every eligible KRW market, ordered by AVERAGE traded value over the last
     VALUE_WINDOW_DAYS days -- deliberately not the live 24h figure.
 
     Ranking on a 24h snapshot lets a single day's pump into the set: measured
@@ -152,8 +190,15 @@ def top_universe(markets):
     universe than the 75.9% win rate came from. A 30-day average, plus the same
     listing-age floor the backtest used, reproduces 29 of those 30 names.
 
-    Costs ~285 daily-candle requests (about a minute) and replaces a full scan of
-    284 markets (about ten), so the run gets faster, not slower."""
+    The rank is recomputed every run, but the inputs are COMPLETED daily candles,
+    so the result only actually changes once a day, at KST midnight; every run in
+    between produces the identical ordering. And a 30-day mean moves slowly, so a
+    name does not jump tiers on one day's volume -- except right at a boundary,
+    where a coin genuinely sits on the line and flipping between 🔔 and 🔎 across a
+    midnight is the honest display rather than a glitch.
+
+    Returns [(rank, market)] with rank starting at 1, plus the fetch-failure count.
+    Costs ~285 daily-candle requests (about a minute)."""
     today_kst = datetime.now(KST).strftime('%Y-%m-%d')
     scored = []
     too_new = failed = 0
@@ -177,7 +222,39 @@ def top_universe(markets):
     print(f"Ranked {len(scored)} markets by {VALUE_WINDOW_DAYS}d average value "
           f"({too_new} skipped: less than {MIN_HISTORY_DAYS} days listed, "
           f"{failed} fetch failures)")
-    return [m for _, m in scored[:UNIVERSE_SIZE]], failed
+    return [(r, m) for r, (_, m) in enumerate(scored, 1)], failed
+
+
+def cached_ranking(markets):
+    """ranked_markets(), but computed once per KST day instead of once per run.
+
+    The ranking averages COMPLETED daily candles, so its value cannot change until
+    a new daily candle closes at KST midnight -- every run in between was paying
+    ~285 requests (roughly 2 of the 3.5 local minutes) to recompute an identical
+    list. Caching it is what makes a scan of all 262 markets cheap enough to run
+    hourly. The file is committed back by the workflow, like the other ledgers.
+
+    A cache miss (new day, missing or unreadable file) just recomputes, so a failed
+    commit costs one slow run rather than a wrong universe."""
+    today = datetime.now(KST).strftime('%Y-%m-%d')
+    try:
+        with open(RANKING_FILE, encoding='utf-8') as f:
+            cached = json.load(f)
+        if cached.get('date') == today and len(cached.get('markets', [])) >= MIN_RANKED:
+            ranked = [(r, m) for r, m in enumerate(cached['markets'], 1)]
+            print(f"Ranking: cached for {today} ({len(ranked)} markets, no re-fetch)")
+            return ranked, 0, False
+    except Exception:
+        pass
+    ranked, failed = ranked_markets(markets)
+    if len(ranked) >= MIN_RANKED:
+        try:
+            with open(RANKING_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'date': today, 'markets': [m for _, m in ranked]}, f)
+            print(f"ranking.json updated ({len(ranked)} markets for {today})")
+        except Exception as e:
+            print(f"could not write {RANKING_FILE}: {e}")
+    return ranked, failed, True
 
 
 def load_sent():
@@ -263,6 +340,33 @@ def send_telegram(text):
         return False
 
 
+def send_run_ping(btc_bar, regime_ok, scanned, near, cached):
+    """TEMPORARY per-run confirmation (see PING_EVERY_RUN).
+
+    Deliberately carries the run's own clock time: the point is to show WHICH hours
+    actually fired, which a bar timestamp cannot show (several runs share one bar).
+    Returns True if it went out, so the caller can skip the daily report and not
+    send two near-identical messages in the same run."""
+    if not PING_EVERY_RUN:
+        return False
+    now = datetime.now(KST)
+    if regime_ok:
+        body = (f"검사 대상: {scanned}종{' (순위 캐시)' if cached else ' (순위 재계산)'}\n"
+                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                f"결과: 조건 충족 0건\n"
+                f"  스토캐스틱 30돌파 {near['stoch']}건 / MACD 0돌파 {near['macd']}건 / "
+                f"둘 다 같은 봉 {near['both']}건")
+    else:
+        body = (f"BTC 국면: strong_bull 아님 → 종목 스캔 안 함\n"
+                f"기준봉: {kst_str(btc_bar)} 마감")
+    return send_telegram(
+        f"🧪 스캔 실행 확인 {now.strftime('%m-%d %H:%M')} KST\n\n"
+        f"{body}\n\n"
+        "※ 스케줄이 실제로 몇 시에 도는지 확인하려고 매 회차 보내는 임시 메시지입니다.\n"
+        "실매매 신호가 아닙니다. 확인 끝나면 끕니다."
+    )
+
+
 # ------------------------------------------------------------------ main
 def main():
     now_kst = datetime.now(KST).strftime('%Y-%m-%d %H:%M')
@@ -290,6 +394,12 @@ def main():
     window = [x['candle_date_time_utc'] for x in btc[-CATCHUP_BARS:]]
     if not any(regime.get(t) for t in window):
         print(f"Regime gate CLOSED on all of the last {CATCHUP_BARS} bars. Exiting quietly.")
+        # The per-run ping already says the gate was closed, so it stands in for the
+        # day's report rather than being sent alongside it.
+        if send_run_ping(btc_bar, False, 0, None, False):
+            if daily_report_due():
+                mark_daily_report()
+            return
         # Report once a day even here: a closed gate is a normal, common state, and
         # the point of the report is that silence never has to be interpreted.
         if daily_report_due():
@@ -308,25 +418,27 @@ def main():
     krw_all = [m['market'] for m in mk if m['market'].startswith('KRW-')
                and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
 
-    # Scan ONLY the universe the rule was validated on. A full-market backtest
-    # (261 markets, 3 years, same rule) showed the edge does not survive outside it:
+    # Scan EVERY eligible KRW market, but do not present them alike. A full-market
+    # backtest (261 markets, 3 years, same rule and exit) measured 2026-09-09:
     #   top 30   WR 75.9%  payoff 0.42  expectancy +0.54%   <- breakeven WR is 70.4%
     #   31-100   WR 63.3%  payoff 0.50  expectancy -0.26%
     #   101+     WR 59.7%  payoff 0.39  expectancy -1.19%
     #   all 261  WR 58.9%  payoff 0.42  expectancy -1.03%
     # The payoff ratio is roughly constant across tiers -- what collapses is the win
     # rate, and with a +3%/-9% exit the breakeven win rate is 70.4%, so only the top
-    # tier clears it. Widening the universe turns +0.54% into -1.03% per trade.
-    krw, rank_failures = top_universe(krw_all)
+    # tier clears it. Treating all 261 as one pool turns +0.54% into -1.03% per trade,
+    # so the tiers are kept visibly apart in the alert (see TIERS / tier_of).
+    ranked, rank_failures, ranking_fresh = cached_ranking(krw_all)
     # Same principle as the BTC bar shortage above: a universe we could not build
     # is a data failure, not a quiet 'no signal'. Without this the run would scan
     # nothing, print 0 signals and report success.
-    if len(krw) < UNIVERSE_SIZE:
-        print(f"ERROR: ranked only {len(krw)} markets ({rank_failures} fetch failures).")
-        send_telegram(f"⚠️ 업비트 스캐너 오류: 거래대금 순위를 {len(krw)}종밖에 못 만들었습니다"
+    if len(ranked) < MIN_RANKED:
+        print(f"ERROR: ranked only {len(ranked)} markets ({rank_failures} fetch failures).")
+        send_telegram(f"⚠️ 업비트 스캐너 오류: 거래대금 순위를 {len(ranked)}종밖에 못 만들었습니다"
                       f"(조회 실패 {rank_failures}건). 대상 선정 불가로 이번 회차 건너뜀.")
         sys.exit(1)
-    print(f"Universe: top {len(krw)} of {len(krw_all)} KRW markets (the validated set)")
+    print(f"Universe: all {len(ranked)} eligible of {len(krw_all)} KRW markets "
+          f"(top {UNIVERSE_SIZE} = validated tier)")
     print(f"Scanning on last completed bar ...")
 
     already_sent = load_sent()
@@ -335,7 +447,7 @@ def main():
     failures = 0
     checked = 0
     near = {'stoch': 0, 'macd': 0, 'both': 0}   # for the daily report
-    for mkt in krw:
+    for rank, mkt in ranked:
         try:
             c = completed_candles(mkt, 200)
             if len(c) < 100:
@@ -374,9 +486,10 @@ def main():
                 hits.append({
                     'market': mkt, 'price': close[j], 'k': k[j],
                     'ma60_gap': (close[j] - ma60[j]) / ma60[j] * 100,
-                    'bar': ts,
+                    'bar': ts, 'rank': rank, 'tier': tier_of(rank),
                 })
-                print(f"  SIGNAL {mkt} @ {close[j]} (bar {ts})")
+                print(f"  SIGNAL {mkt} (rank {rank}, tier {tier_of(rank)}) "
+                      f"@ {close[j]} (bar {ts})")
         except Exception as e:
             failures += 1
 
@@ -384,11 +497,16 @@ def main():
 
     if not hits:
         print("No signals this bar. No alert sent.")
+        if send_run_ping(btc_bar, True, len(ranked), near, not ranking_fresh):
+            if daily_report_due():
+                mark_daily_report()
+            return
         if daily_report_due():
             if send_telegram(
                 "📋 업비트 스캐너 일일 점검\n\n"
                 "BTC 국면: strong_bull ✅ (알림 조건 열림)\n"
-                f"검사 대상: 거래대금 상위 {len(krw)}종\n"
+                f"검사 대상: 원화마켓 {len(ranked)}종 전체 "
+                f"(상위 {UNIVERSE_SIZE}종만 🔔 검증된 신호)\n"
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
                 "결과: 조건 충족 0건\n\n"
                 f"근접 상황 (최근 {CATCHUP_BARS}봉 · {checked}개 조합)\n"
@@ -396,7 +514,7 @@ def main():
                 f"  MACD 0돌파 {near['macd']}건\n"
                 f"  둘 다 같은 봉 {near['both']}건 ← 여기가 0이면 신호 없음\n\n"
                 "이 메시지가 보이면 알림 경로가 정상입니다.\n"
-                "신호는 2~3주에 1회 수준이라 조용한 날이 대부분입니다."):
+                "🔔 검증된 신호는 2~3주에 1회, 🔎 참고용은 하루 1건 안팎입니다."):
                 mark_daily_report()
         if TEST_ALERT:
             # Diagnostic ping: proves the Secrets are wired even on a quiet bar.
@@ -404,39 +522,81 @@ def main():
             send_telegram(
                 "🩺 진단 실행 (수동)\n\n"
                 f"BTC 국면: 기준봉 strong_bull={regime[btc_bar]} (봉별로 판정)\n"
-                f"검사 대상: 원화마켓 상위 {len(krw)}종 (거래대금 30일 평균)\n"
+                f"검사 대상: 원화마켓 {len(ranked)}종 전체 (거래대금 30일 평균 순위)\n"
+                f"  🔔 검증된 신호: 상위 {UNIVERSE_SIZE}종\n"
+                f"  🔎 참고용: {UNIVERSE_SIZE + 1}위 이하\n"
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
                 f"결과: 조건 충족 0건 → 평상시라면 알림 없음\n\n"
-                "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다.\n"
-                "이 규칙은 연 22건(2~3주에 1회) 수준이라 조용한 날이 대부분입니다."
+                "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다."
             )
         return
 
     # ---- 3. alert ----
-    hits.sort(key=lambda x: (x['bar'], -x['ma60_gap']))
-    lines = [f"🔔 업비트 신호 {len(hits)}건", ""]
-    for h in hits:
-        tk = h['market'].replace('KRW-', '')
-        p = h['price']
-        lines.append(f"{tk}  {fmt_price(p)}원   ({kst_str(h['bar'])} 봉)")
-        lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
-                     f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
-        lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
-    lines += [
-        "",
-        "규칙: 강세장(BTC>MA200 & MA50>MA200) + 스토캐스틱30돌파 + MACD0돌파 + 종가>MA60",
-        "대상: 거래대금 상위 30종(30일 평균) — 규칙이 검증된 범위",
-        "이 범위 3년 백테스트: 승률 75.9% (클러스터 54건), PF 1.34, 기대값 +0.54%/거래",
-        "※ 구간 분류에 현재 거래대금 순위를 과거에 소급 적용 — 순수 표본외 성적은 아님",
-        "⚠️ 2024-06~2025-03 구간에선 손실(-2.8%)을 낸 규칙. 조건 충족 사실 전달일 뿐 투자 조언 아님.",
-    ]
-    if send_telegram("\n".join(lines)):
+    if send_telegram(build_alert(hits)):
         save_sent(already_sent | set(new_keys))
         # A real alert already proves the channel works, so skip today's report.
         if daily_report_due():
             mark_daily_report()
     else:
         print("Telegram failed - NOT marking these signals as sent, so the next run retries.")
+
+
+def build_alert(hits):
+    """Render the alert text. Separate from main() so the layout can be checked
+    without hitting the network or sending anything."""
+    # Two tiers, deliberately not interleaved. The same three conditions fired for
+    # every name here, but only the top tier's win rate clears the +3%/-9% breakeven,
+    # so mixing them into one list would lend the unvalidated ones a 75.9% that was
+    # never measured for them.
+    hits = sorted(hits, key=lambda x: (x['tier'], x['bar'], -x['ma60_gap']))
+    verified = [h for h in hits if h['tier'] == 0]
+    reference = [h for h in hits if h['tier'] != 0]
+
+    # The summary line only earns its place when both kinds are present; with one
+    # kind it just repeats the section header below it.
+    lines = []
+    if verified and reference:
+        lines += [f"🔔 검증된 신호 {len(verified)}건 · 🔎 참고용 {len(reference)}건", ""]
+
+    if verified:
+        spec = TIERS[0]
+        lines.append(f"🔔 검증된 신호 {len(verified)}건 — 거래대금 상위 {UNIVERSE_SIZE}종")
+        for h in verified:
+            p = h['price']
+            lines.append(f"{h['market'].replace('KRW-', '')}  {fmt_price(p)}원   "
+                         f"({kst_str(h['bar'])} 봉 · {h['rank']}위)")
+            lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
+                         f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
+            lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
+        lines.append(f"→ 이 구간 3년 성적: 승률 {spec[3]}%, PF {spec[4]}, "
+                     f"기대값 {spec[5]:+.2f}% (손익분기 {spec[6]}%)")
+        lines.append("")
+
+    if reference:
+        lines.append(f"🔎 참고용 {len(reference)}건 — 검증범위 밖, 백테스트가 보증하지 않음")
+        for h in reference[:MAX_REFERENCE_LINES]:
+            p = h['price']
+            lines.append(f"{h['market'].replace('KRW-', '')}  {fmt_price(p)}원  "
+                         f"{h['rank']}위 · {kst_str(h['bar'])} 봉 · MA60 {h['ma60_gap']:+.0f}%")
+        if len(reference) > MAX_REFERENCE_LINES:
+            lines.append(f"   … 외 {len(reference) - MAX_REFERENCE_LINES}건 (생략)")
+        # One stats line per tier actually present, so the numbers shown always
+        # belong to the names listed above them.
+        for t in sorted({h['tier'] for h in reference}):
+            spec = TIERS[t]
+            lo = TIERS[t - 1][0] + 1
+            rng = f"{lo}~{spec[0]}위" if spec[0] < 10 ** 8 else f"{lo}위 이하"
+            lines.append(f"→ {rng} 3년 성적: 승률 {spec[3]}%, PF {spec[4]}, "
+                         f"기대값 {spec[5]:+.2f}% (손익분기 {spec[6]}%) ⚠️ 마이너스")
+        lines.append("")
+
+    lines += [
+        "규칙: 강세장(BTC>MA200 & MA50>MA200) + 스토캐스틱30돌파 + MACD0돌파 + 종가>MA60",
+        "순위: 일봉 30일 평균 거래대금 (KST 자정에 하루 한 번 갱신)",
+        "※ 구간 분류에 현재 거래대금 순위를 과거에 소급 적용 — 순수 표본외 성적은 아님",
+        "⚠️ 2024-06~2025-03 구간에선 상위 30종도 손실(-2.8%). 조건 충족 사실 전달일 뿐 투자 조언 아님.",
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

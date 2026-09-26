@@ -5,9 +5,18 @@ name: Upbit Signal Scanner
 # and skipped (observed: 4 of 6 fired, up to ~3h late). Running hourly plus the
 # CATCHUP_BARS re-check in scan.py means a signal survives several missed runs;
 # sent.json keeps the overlap from re-alerting.
+#
+# A run now takes ~15 min, so an hourly schedule still leaves the concurrency group
+# clear between runs -- runs queue rather than overlap (cancel-in-progress: false).
 on:
   schedule:
+    # Two attempts an hour, both off the top of the hour. GitHub drops scheduled
+    # runs when its queue is busy and :00 is the worst minute for that; measured
+    # 2026-09-13..25 a single ':06' cron actually fired 5-7 times a DAY, not 24.
+    # Two staggered attempts cannot force a run, but each one is an independent
+    # chance, so the expected gap between real runs shrinks.
     - cron: '6 * * * *'
+    - cron: '34 * * * *'
   workflow_dispatch:
     inputs:
       test_alert:
@@ -25,7 +34,13 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Scanning every KRW market (not just the top 30) is ~800 Upbit requests: the
+    # daily-candle ranking pass plus two paginated 4h pulls per market. On the runner
+    # that measured ~1s per round trip, so a run lands around 13-15 min against the
+    # 5m31s the top-30-only version took. 25 left too little headroom for a slow API
+    # day -- a timeout kills the run mid-scan and the signal is silently lost until
+    # the next hour's catch-up.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,18 +51,24 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_ALERT: ${{ inputs.test_alert }}
+          # TEMPORARY: confirmation message on every run, to see which hours really
+          # fire. Set repo variable PING_EVERY_RUN to 'false' to stop it without a
+          # commit (Settings -> Secrets and variables -> Actions -> Variables).
+          PING_EVERY_RUN: ${{ vars.PING_EVERY_RUN || 'true' }}
         run: python scan.py
 
       # Persist the dedup ledger and the daily-report date. Without heartbeat.json
       # surviving the run, daily_report_due() is true again on the next run and the
-      # status report goes out every hour instead of once a day.
+      # status report goes out every hour instead of once a day. ranking.json is
+      # here for the same reason: if it does not survive, every run pays the ~285
+      # daily-candle requests again to rebuild an identical list.
       - name: Persist ledgers
         if: always()
         run: |
-          if [[ -n "$(git status --porcelain sent.json heartbeat.json)" ]]; then
+          if [[ -n "$(git status --porcelain sent.json heartbeat.json ranking.json)" ]]; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add sent.json heartbeat.json
+            git add sent.json heartbeat.json ranking.json
             git commit -m "chore: update alert ledger [skip ci]"
             git push
           else
