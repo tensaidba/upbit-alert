@@ -9,12 +9,14 @@ RULE (walk-forward validated, 3 years, cluster-adjusted, after 0.2% costs):
   Regime gate: BTC 4h close > MA200 AND MA50 > MA200  (strong_bull only)
   Exit: TP +3% / SL -9% / max 30 bars (5 days)
 
-SCOPE: every eligible KRW market is scanned, but signals are reported in two tiers,
+SCOPE: every eligible KRW market is scanned, and signals go out in THREE levels,
   because the edge is confined to the top of the liquidity ranking (see tier_of):
-    top 30  -> 🔔 validated    WR 75.9%, expectancy +0.54%  (breakeven WR 70.2%)
-    31+     -> 🔎 reference    WR 59.7-63.3%, expectancy negative
-  The unvalidated ones are shown because the user asked to see them, and labelled
-  because acting on them the same way is what the backtest says loses money.
+    A  1~30위    🔔 validated   WR 75.9%, expectancy +0.54%  (breakeven 70.2%)
+    B  31~100위  🔎 reference   WR 63.3%, expectancy -0.26%  (breakeven 66.6%)
+    C  101위+    ⚠️ speculative WR 59.7%, expectancy -1.19%  (breakeven 72.0%)
+  B and C are shown because the user asked to see them. They are kept in separate
+  sections with their own measured numbers rather than one "unvalidated" bucket:
+  B misses breakeven by 3.3 points and C by 12.3, which one shared label hides.
 
   Backtest (top 30): n=54 events, WR 75.9%, PF 1.34, expectancy +0.54%/trade.
   KNOWN WEAKNESS: lost money in the 2024-06~2025-03 window (50.0% WR, -2.84%).
@@ -48,15 +50,19 @@ VALUE_WINDOW_DAYS = 30  # rank on a 30-day average, NOT a live 24h snapshot (see
 MAX_REFERENCE_LINES = 12  # a market-wide turn can fire dozens of unvalidated signals at once
                           # and Telegram caps a message at 4096 chars; the rest are counted, not listed.
 MIN_HISTORY_DAYS = 67   # the backtest required >=400 4h bars of history; new listings were excluded
-# Every KRW stablecoin market as of 2026-09-27. Explicit because it is cheap and
-# exact -- but it is not the real guard; see MIN_RANGE_PCT.
+# Every KRW stablecoin market as of 2026-09-27. KRW-USDS signalled on this date
+# and an alert went out, because the list was only ('USDT','USDC','DAI','USDG')
+# and Upbit had since listed five more. A peg cannot reach the +3% take-profit,
+# so its crossings are noise around the peg rather than a setup.
 STABLE_HINTS = ('USDT', 'USDC', 'DAI', 'USDG', 'USDS', 'USDE', 'USD1', 'RLUSD', 'PYUSD')
-# A pegged asset cannot reach a +3% take-profit, so a stochastic/MACD crossing on
-# one is noise around the peg rather than a setup. KRW-USDS fired exactly that on
-# 2026-09-27 (1352-1365, 0.0-0.7% per bar) because the name list missed it, and a
-# name list always lags the next listing. This floor does not: 6% over the last
-# 60 bars (10 days) sits far below any real coin and far above any peg.
-MIN_RANGE_PCT = 6.0
+# REJECTED: a volatility floor as a second, name-independent guard. Measured
+# 2026-09-27 over the live universe, a 6% floor on the last 60 bars excluded
+# TRX 5.31%, XAUT 4.59% and SUN 4.37% -- real coins in a quiet stretch -- while
+# the pegs it was meant to catch sat at USDS 4.33% and USD1 3.29%. A KRW-quoted
+# stablecoin is not flat: the won leg supplies several percent on its own, so
+# there is no threshold that keeps TRX and drops USDS. Dropping a real coin
+# silently is worse than one bogus alert, so the explicit list above is the only
+# guard. When Upbit lists another stablecoin, add it there.
 TEST_ALERT = os.environ.get('TEST_ALERT', '').lower() == 'true'
 # TEMPORARY: send a short confirmation on EVERY run, so the real schedule is visible
 # instead of inferred. GitHub fires only 5-7 of 24 hourly schedules (measured
@@ -168,11 +174,18 @@ def btc_regime_by_bar(btc):
 
 
 TIERS = (
-    # (rank_max, icon, label, win_rate, profit_factor, expectancy, breakeven_wr)
-    (UNIVERSE_SIZE, '🔔', '검증된 신호', 75.9, 1.34, +0.54, 70.2),
-    (100,           '🔎', '참고용 (미검증)', 63.3, 0.87, -0.26, 66.6),
-    (10 ** 9,       '🔎', '참고용 (미검증)', 59.7, 0.57, -1.19, 72.0),
+    # (rank_max, level, icon, label, range_text, win_rate, PF, expectancy, breakeven_wr)
+    # Three levels rather than two, because "unvalidated" lumped 31-100 together with
+    # 101+ when their measured results are not remotely alike: 31-100 misses breakeven
+    # by 3.3 points, 101+ misses it by 12.3. One label for both understates the second.
+    (UNIVERSE_SIZE, 'A', '🔔', '검증된 신호', f'1~{UNIVERSE_SIZE}위',
+     75.9, 1.34, +0.54, 70.2),
+    (100, 'B', '🔎', '참고 · 손익분기 근처', f'{UNIVERSE_SIZE + 1}~100위',
+     63.3, 0.87, -0.26, 66.6),
+    (10 ** 9, 'C', '⚠️', '투기 · 측정상 손실', '101위 이하',
+     59.7, 0.57, -1.19, 72.0),
 )
+RANK_MAX, LEVEL, ICON, LABEL, RANGE, WR, PF, EXP, BREAKEVEN = range(9)
 
 
 def tier_of(rank):
@@ -184,7 +197,7 @@ def tier_of(rank):
     ~70%, so only the top tier clears it. That is why tier 1 and 2 signals go out
     labelled as unvalidated instead of as 🔔 signals."""
     for t, spec in enumerate(TIERS):
-        if rank <= spec[0]:
+        if rank <= spec[RANK_MAX]:
             return t
     return len(TIERS) - 1
 
@@ -349,7 +362,27 @@ def send_telegram(text):
         return False
 
 
-def send_run_ping(btc_bar, regime_ok, scanned, near, cached, funnel='', regime_status=''):
+def watch_lines(watch, limit=10):
+    """The names that can actually fire next, closest first, with rank and level.
+
+    Condition 1 is %K crossing UP THROUGH 30, so a coin already above 30 cannot
+    produce a signal no matter how far it runs -- only these can. ② marks MACD
+    histogram already at or above 0 and ③ close above MA60, so a row showing both
+    is one bar of %K away from a full setup."""
+    if not watch:
+        return "돌파 대기 후보 없음 (모든 종목 %K가 30 위 — 뚫을 자리가 없음)"
+    rows = sorted(watch, key=lambda w: w['k'])[:limit]
+    out = [f"돌파 대기 후보 {len(watch)}종 (%K<30, 낮은 순 {len(rows)}개)"]
+    for w in rows:
+        spec = TIERS[w['tier']]
+        flags = ('②' if w['mh'] >= 0 else '·') + ('③' if w['above_ma60'] else '·')
+        out.append(f"  {spec[LEVEL]} {w['rank']:>3}위 {w['market'].replace('KRW-', ''):<6}"
+                   f" %K {w['k']:4.1f}  {flags}")
+    return "\n".join(out)
+
+
+def send_run_ping(btc_bar, regime_ok, scanned, near, cached, funnel='', regime_status='',
+                  watch=None):
     """TEMPORARY per-run confirmation (see PING_EVERY_RUN).
 
     Deliberately carries the run's own clock time: the point is to show WHICH hours
@@ -365,7 +398,8 @@ def send_run_ping(btc_bar, regime_ok, scanned, near, cached, funnel='', regime_s
                 f"기준봉: {kst_str(btc_bar)} 마감\n"
                 f"{funnel}\n"
                 f"  스토캐스틱 30돌파 {near['stoch']}건 / MACD 0돌파 {near['macd']}건 / "
-                f"둘 다 같은 봉 {near['both']}건")
+                f"둘 다 같은 봉 {near['both']}건\n\n"
+                f"{watch_lines(watch or [])}")
     else:
         body = (f"BTC 국면: strong_bull 아님 → 종목 스캔 안 함\n"
                 f"기준봉: {kst_str(btc_bar)} 마감")
@@ -457,7 +491,7 @@ def main():
     failures = 0
     checked = 0
     insufficient = 0
-    pegged = 0
+    watch = []
     # Funnel counters. "0 signals" has several very different causes -- nothing
     # matched, something matched but BTC was not strong_bull on that bar, or it
     # matched and was already alerted -- and collapsing them into one number is
@@ -473,12 +507,6 @@ def main():
             close = [x['trade_price'] for x in c]
             high = [x['high_price'] for x in c]
             low = [x['low_price'] for x in c]
-            # Skip instruments the exit rule cannot act on at all. A peg moves
-            # under 1% while the rule needs +3%, so its crossings are peg noise.
-            lo60, hi60 = min(low[-60:]), max(high[-60:])
-            if lo60 > 0 and (hi60 / lo60 - 1) * 100 < MIN_RANGE_PCT:
-                pegged += 1
-                continue
             k = stoch_k(high, low, close)
             mh = macd_hist(close)
             ma60 = sma(close, 60)
@@ -517,15 +545,23 @@ def main():
                 })
                 print(f"  SIGNAL {mkt} (rank {rank}, tier {tier_of(rank)}) "
                       f"@ {close[j]} (bar {ts})")
+            # Watchlist for the hourly message: %K still under 30 on the newest bar.
+            # These are the only names that CAN fire next, because condition 1 is a
+            # cross UP THROUGH 30 -- a coin already above 30 has nothing left to
+            # cross. The rank rides along so the level is visible at a glance.
+            if k[-1] is not None and k[-1] < 30:
+                watch.append({'rank': rank, 'tier': tier_of(rank), 'market': mkt,
+                              'k': k[-1], 'mh': mh[-1],
+                              'above_ma60': ma60[-1] is not None and close[-1] > ma60[-1]})
         except Exception as e:
             failures += 1
 
-    print(f"Scan done: {len(hits)} signals, {failures} fetch failures")
+    print(f"Scan done: {len(hits)} signals, {failures} fetch failures, "
+          f"{len(watch)} on watchlist")
 
     funnel = (f"조건 충족 {raw_matches}건 → BTC 필터 통과 {regime_matches}건 → "
               f"기발송 제외 {duplicates}건 → 신규 {len(hits)}건\n"
-              f"조회 실패 {failures}종 / 이력 부족 {insufficient}종 / "
-              f"변동성 미달 {pegged}종 / 순위 실패 {rank_failures}건")
+              f"조회 실패 {failures}종 / 이력 부족 {insufficient}종 / 순위 실패 {rank_failures}건")
     print(funnel)
 
     # A scan that evaluated NOTHING is a data failure, not a quiet day. Without this
@@ -550,7 +586,7 @@ def main():
     if not hits:
         print(result_status)
         if send_run_ping(btc_bar, True, len(ranked), near, not ranking_fresh,
-                         funnel, regime_status):
+                         funnel, regime_status, watch):
             if daily_report_due():
                 mark_daily_report()
             return
@@ -567,7 +603,8 @@ def main():
                 f"  MACD 0돌파 {near['macd']}건\n"
                 f"  둘 다 같은 봉 {near['both']}건 ← 여기가 0이면 신호 없음\n\n"
                 "이 메시지가 보이면 알림 경로가 정상입니다.\n"
-                "🔔 검증된 신호는 2~3주에 1회, 🔎 참고용은 하루 1건 안팎입니다."):
+                "🔔A(1~30위) 2~3주에 1회 · 🔎B(31~100위) 며칠에 1회 · "
+                "⚠️C(101위 이하) 하루 1건 안팎"):
                 mark_daily_report()
         if TEST_ALERT:
             # Diagnostic ping: proves the Secrets are wired even on a quiet bar.
@@ -576,11 +613,11 @@ def main():
                 "🩺 진단 실행 (수동)\n\n"
                 f"BTC 국면: 기준봉 strong_bull={regime[btc_bar]} (봉별로 판정)\n"
                 f"검사 대상: 원화마켓 {len(ranked)}종 전체 (거래대금 30일 평균 순위)\n"
-                f"  🔔 검증된 신호: 상위 {UNIVERSE_SIZE}종\n"
-                f"  🔎 참고용: {UNIVERSE_SIZE + 1}위 이하\n"
-                f"기준봉: {kst_str(btc_bar)} 마감\n"
-                f"결과: {result_status}\n{funnel}\n\n"
-                "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다."
+                + "".join(f"  {s[ICON]}{s[LEVEL]} {s[RANGE]}: 기대값 {s[EXP]:+.2f}%\n"
+                          for s in TIERS)
+                + f"기준봉: {kst_str(btc_bar)} 마감\n"
+                + f"결과: {result_status}\n{funnel}\n\n"
+                + "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다."
             )
         return
 
@@ -600,50 +637,45 @@ def build_alert(hits, funnel=''):
 
     `funnel` is appended only when the scan was incomplete or suppressed duplicates,
     so a normal alert stays clean but a partial one never looks complete."""
-    # Two tiers, deliberately not interleaved. The same three conditions fired for
-    # every name here, but only the top tier's win rate clears the +3%/-9% breakeven,
-    # so mixing them into one list would lend the unvalidated ones a 75.9% that was
-    # never measured for them.
+    # One section per level, never interleaved. The same three conditions fired for
+    # every name here, so a single list would lend level C the 75.9% that was only
+    # ever measured for level A. Each section carries its OWN measured result, right
+    # under the names it applies to.
     hits = sorted(hits, key=lambda x: (x['tier'], x['bar'], -x['ma60_gap']))
-    verified = [h for h in hits if h['tier'] == 0]
-    reference = [h for h in hits if h['tier'] != 0]
+    by_level = [[h for h in hits if h['tier'] == t] for t in range(len(TIERS))]
 
-    # The summary line only earns its place when both kinds are present; with one
-    # kind it just repeats the section header below it.
+    # The summary line only earns its place when more than one level is present;
+    # with one it just repeats the section header below it.
+    present = [t for t, g in enumerate(by_level) if g]
     lines = []
-    if verified and reference:
-        lines += [f"🔔 검증된 신호 {len(verified)}건 · 🔎 참고용 {len(reference)}건", ""]
+    if len(present) > 1:
+        lines += [" · ".join(f"{TIERS[t][ICON]}{TIERS[t][LEVEL]} {len(by_level[t])}건"
+                             for t in present), ""]
 
-    if verified:
-        spec = TIERS[0]
-        lines.append(f"🔔 검증된 신호 {len(verified)}건 — 거래대금 상위 {UNIVERSE_SIZE}종")
-        for h in verified:
-            p = h['price']
-            lines.append(f"{h['market'].replace('KRW-', '')}  {fmt_price(p)}원   "
-                         f"({kst_str(h['bar'])} 봉 · {h['rank']}위)")
-            lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
-                         f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
-            lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
-        lines.append(f"→ 이 구간 3년 성적: 승률 {spec[3]}%, PF {spec[4]}, "
-                     f"기대값 {spec[5]:+.2f}% (손익분기 {spec[6]}%)")
-        lines.append("")
-
-    if reference:
-        lines.append(f"🔎 참고용 {len(reference)}건 — 검증범위 밖, 백테스트가 보증하지 않음")
-        for h in reference[:MAX_REFERENCE_LINES]:
-            p = h['price']
-            lines.append(f"{h['market'].replace('KRW-', '')}  {fmt_price(p)}원  "
-                         f"{h['rank']}위 · {kst_str(h['bar'])} 봉 · MA60 {h['ma60_gap']:+.0f}%")
-        if len(reference) > MAX_REFERENCE_LINES:
-            lines.append(f"   … 외 {len(reference) - MAX_REFERENCE_LINES}건 (생략)")
-        # One stats line per tier actually present, so the numbers shown always
-        # belong to the names listed above them.
-        for t in sorted({h['tier'] for h in reference}):
-            spec = TIERS[t]
-            lo = TIERS[t - 1][0] + 1
-            rng = f"{lo}~{spec[0]}위" if spec[0] < 10 ** 8 else f"{lo}위 이하"
-            lines.append(f"→ {rng} 3년 성적: 승률 {spec[3]}%, PF {spec[4]}, "
-                         f"기대값 {spec[5]:+.2f}% (손익분기 {spec[6]}%) ⚠️ 마이너스")
+    for t in present:
+        spec, group = TIERS[t], by_level[t]
+        lines.append(f"{spec[ICON]} 레벨 {spec[LEVEL]} · {spec[LABEL]} "
+                     f"{len(group)}건 — {spec[RANGE]}")
+        # Level A gets the full trade plan; the losing levels get one compact line
+        # each, so the message never reads as a plan for a trade that loses money.
+        if t == 0:
+            for h in group:
+                p = h['price']
+                lines.append(f"{h['market'].replace('KRW-', '')}  {fmt_price(p)}원   "
+                             f"({kst_str(h['bar'])} 봉 · {h['rank']}위)")
+                lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
+                             f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
+                lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
+        else:
+            for h in group[:MAX_REFERENCE_LINES]:
+                lines.append(f"{h['market'].replace('KRW-', '')}  "
+                             f"{fmt_price(h['price'])}원  {h['rank']}위 · "
+                             f"{kst_str(h['bar'])} 봉 · MA60 {h['ma60_gap']:+.0f}%")
+            if len(group) > MAX_REFERENCE_LINES:
+                lines.append(f"   … 외 {len(group) - MAX_REFERENCE_LINES}건 (생략)")
+        warn = '' if spec[EXP] > 0 else '  ⚠️ 기대값 마이너스'
+        lines.append(f"→ 3년 성적: 승률 {spec[WR]}%, PF {spec[PF]}, "
+                     f"기대값 {spec[EXP]:+.2f}% (손익분기 {spec[BREAKEVEN]}%){warn}")
         lines.append("")
 
     lines += [
