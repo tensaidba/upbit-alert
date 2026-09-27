@@ -48,6 +48,15 @@ VALUE_WINDOW_DAYS = 30  # rank on a 30-day average, NOT a live 24h snapshot (see
 MAX_REFERENCE_LINES = 12  # a market-wide turn can fire dozens of unvalidated signals at once
                           # and Telegram caps a message at 4096 chars; the rest are counted, not listed.
 MIN_HISTORY_DAYS = 67   # the backtest required >=400 4h bars of history; new listings were excluded
+# Every KRW stablecoin market as of 2026-09-27. Explicit because it is cheap and
+# exact -- but it is not the real guard; see MIN_RANGE_PCT.
+STABLE_HINTS = ('USDT', 'USDC', 'DAI', 'USDG', 'USDS', 'USDE', 'USD1', 'RLUSD', 'PYUSD')
+# A pegged asset cannot reach a +3% take-profit, so a stochastic/MACD crossing on
+# one is noise around the peg rather than a setup. KRW-USDS fired exactly that on
+# 2026-09-27 (1352-1365, 0.0-0.7% per bar) because the name list missed it, and a
+# name list always lags the next listing. This floor does not: 6% over the last
+# 60 bars (10 days) sits far below any real coin and far above any peg.
+MIN_RANGE_PCT = 6.0
 TEST_ALERT = os.environ.get('TEST_ALERT', '').lower() == 'true'
 # TEMPORARY: send a short confirmation on EVERY run, so the real schedule is visible
 # instead of inferred. GitHub fires only 5-7 of 24 hourly schedules (measured
@@ -417,7 +426,7 @@ def main():
     # ---- 2. scan ----
     mk = fetch(f"{BASE}/market/all?isDetails=false")
     krw_all = [m['market'] for m in mk if m['market'].startswith('KRW-')
-               and not any(s in m['market'] for s in ('USDT', 'USDC', 'DAI', 'USDG'))]
+               and not any(s in m['market'] for s in STABLE_HINTS)]
 
     # Scan EVERY eligible KRW market, but do not present them alike. A full-market
     # backtest (261 markets, 3 years, same rule and exit) measured 2026-09-09:
@@ -448,6 +457,7 @@ def main():
     failures = 0
     checked = 0
     insufficient = 0
+    pegged = 0
     # Funnel counters. "0 signals" has several very different causes -- nothing
     # matched, something matched but BTC was not strong_bull on that bar, or it
     # matched and was already alerted -- and collapsing them into one number is
@@ -463,6 +473,12 @@ def main():
             close = [x['trade_price'] for x in c]
             high = [x['high_price'] for x in c]
             low = [x['low_price'] for x in c]
+            # Skip instruments the exit rule cannot act on at all. A peg moves
+            # under 1% while the rule needs +3%, so its crossings are peg noise.
+            lo60, hi60 = min(low[-60:]), max(high[-60:])
+            if lo60 > 0 and (hi60 / lo60 - 1) * 100 < MIN_RANGE_PCT:
+                pegged += 1
+                continue
             k = stoch_k(high, low, close)
             mh = macd_hist(close)
             ma60 = sma(close, 60)
@@ -508,7 +524,8 @@ def main():
 
     funnel = (f"조건 충족 {raw_matches}건 → BTC 필터 통과 {regime_matches}건 → "
               f"기발송 제외 {duplicates}건 → 신규 {len(hits)}건\n"
-              f"조회 실패 {failures}종 / 이력 부족 {insufficient}종 / 순위 실패 {rank_failures}건")
+              f"조회 실패 {failures}종 / 이력 부족 {insufficient}종 / "
+              f"변동성 미달 {pegged}종 / 순위 실패 {rank_failures}건")
     print(funnel)
 
     # A scan that evaluated NOTHING is a data failure, not a quiet day. Without this
