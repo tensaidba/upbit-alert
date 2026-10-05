@@ -7,19 +7,22 @@ RULE (walk-forward validated, 3 years, cluster-adjusted, after 0.2% costs):
     - MACD histogram (12,26,9) crosses UP through 0
     - close > MA60
   Regime gate: BTC 4h close > MA200 AND MA50 > MA200  (strong_bull only)
-  Exit: TP +3% / SL -9% / max 30 bars (5 days)
+  Exit: TP +5% / SL -9% / max 30 bars (5 days)  (TP was +3% until 2026-10-05)
 
 SCOPE: every eligible KRW market is scanned, and signals go out in THREE levels,
   because the edge is confined to the top of the liquidity ranking (see tier_of):
-    A  1~30위    🔔 validated   WR 75.9%, expectancy +0.54%  (breakeven 70.2%)
-    B  31~100위  🔎 reference   WR 63.3%, expectancy -0.26%  (breakeven 66.6%)
-    C  101위+    ⚠️ speculative WR 59.7%, expectancy -1.19%  (breakeven 72.0%)
+    A  1~30위    🔔 validated   WR 58.8%, expectancy +0.14%  (breakeven 57.6%)
+    B  31~100위  🔎 reference   WR 58.3%, expectancy +0.10%  (breakeven 57.3%)
+    C  101위+    ⚠️ speculative WR 51.8%, expectancy -1.05%  (breakeven 61.4%)
   B and C are shown because the user asked to see them. They are kept in separate
   sections with their own measured numbers rather than one "unvalidated" bucket:
   B misses breakeven by 3.3 points and C by 12.3, which one shared label hides.
 
-  Backtest (top 30): n=54 events, WR 75.9%, PF 1.34, expectancy +0.54%/trade.
-  KNOWN WEAKNESS: lost money in the 2024-06~2025-03 window (50.0% WR, -2.84%).
+  Backtest (top 30, TP+5%): n=51 events, WR 58.8%, PF 1.05, expectancy +0.14%/trade.
+  Same data with TP+3% was WR 74.5%, expectancy +0.41%: the user chose TP+5% on
+  2026-10-05 knowing it cuts expectancy by about two thirds. KRW-STORJ (delisted)
+  is missing from the TP+5% recomputation; B and C reproduced the old TP+3% numbers exactly.
+  KNOWN WEAKNESS: lost money in the 2024-06~2025-03 window (1 win in 6, -5.3%).
 
 IMPORTANT: only COMPLETED bars are evaluated. The in-progress bar is discarded,
 because its stochastic/MACD values still change until close -- evaluating it would
@@ -41,7 +44,7 @@ except Exception:
 BASE = "https://api.upbit.com/v1"
 KST = timezone(timedelta(hours=9))
 BAR_SECONDS = 4 * 3600
-TP_PCT = 3.0
+TP_PCT = 5.0
 SL_PCT = 9.0
 MAX_HOLD_BARS = 30
 UNIVERSE_SIZE = 30      # rule was validated on the top 30 KRW markets by traded value
@@ -52,7 +55,7 @@ MAX_REFERENCE_LINES = 12  # a market-wide turn can fire dozens of unvalidated si
 MIN_HISTORY_DAYS = 67   # the backtest required >=400 4h bars of history; new listings were excluded
 # Every KRW stablecoin market as of 2026-09-27. KRW-USDS signalled on this date
 # and an alert went out, because the list was only ('USDT','USDC','DAI','USDG')
-# and Upbit had since listed five more. A peg cannot reach the +3% take-profit,
+# and Upbit had since listed five more. A peg cannot reach the +5% take-profit,
 # so its crossings are noise around the peg rather than a setup.
 STABLE_HINTS = ('USDT', 'USDC', 'DAI', 'USDG', 'USDS', 'USDE', 'USD1', 'RLUSD', 'PYUSD')
 # REJECTED: a volatility floor as a second, name-independent guard. Measured
@@ -179,11 +182,11 @@ TIERS = (
     # 101+ when their measured results are not remotely alike: 31-100 misses breakeven
     # by 3.3 points, 101+ misses it by 12.3. One label for both understates the second.
     (UNIVERSE_SIZE, 'A', '🔔', '검증된 신호', f'1~{UNIVERSE_SIZE}위',
-     75.9, 1.34, +0.54, 70.2),
+     58.8, 1.05, +0.14, 57.6),
     (100, 'B', '🔎', '참고 · 손익분기 근처', f'{UNIVERSE_SIZE + 1}~100위',
-     63.3, 0.87, -0.26, 66.6),
+     58.3, 1.04, +0.10, 57.3),
     (10 ** 9, 'C', '⚠️', '투기 · 측정상 손실', '101위 이하',
-     59.7, 0.57, -1.19, 72.0),
+     51.8, 0.68, -1.05, 61.4),
 )
 RANK_MAX, LEVEL, ICON, LABEL, RANGE, WR, PF, EXP, BREAKEVEN = range(9)
 
@@ -191,6 +194,7 @@ RANK_MAX, LEVEL, ICON, LABEL, RANGE, WR, PF, EXP, BREAKEVEN = range(9)
 def tier_of(rank):
     """Which liquidity tier a rank falls in. Tier 0 is the only validated one.
 
+    (Numbers below are the TP+3% measurement; TIERS now carries TP+5% figures.)
     Measured 2026-09-09 over all 261 KRW markets, 3 years, same rule and exit:
     the payoff ratio barely moves across tiers (0.39-0.50) -- what collapses is
     the win rate, 75.9% -> 59.7%. With a +3%/-9% exit the breakeven win rate is
@@ -463,7 +467,8 @@ def main():
                and not any(s in m['market'] for s in STABLE_HINTS)]
 
     # Scan EVERY eligible KRW market, but do not present them alike. A full-market
-    # backtest (261 markets, 3 years, same rule and exit) measured 2026-09-09:
+    # backtest (261 markets, 3 years, same rule, TP+3% exit) measured 2026-09-09
+    # (TP+5% figures are in TIERS):
     #   top 30   WR 75.9%  payoff 0.42  expectancy +0.54%   <- breakeven WR is 70.4%
     #   31-100   WR 63.3%  payoff 0.50  expectancy -0.26%
     #   101+     WR 59.7%  payoff 0.39  expectancy -1.19%
@@ -682,7 +687,7 @@ def build_alert(hits, funnel=''):
         "규칙: 강세장(BTC>MA200 & MA50>MA200) + 스토캐스틱30돌파 + MACD0돌파 + 종가>MA60",
         "순위: 일봉 30일 평균 거래대금 (KST 자정에 하루 한 번 갱신)",
         "※ 구간 분류에 현재 거래대금 순위를 과거에 소급 적용 — 순수 표본외 성적은 아님",
-        "⚠️ 2024-06~2025-03 구간에선 상위 30종도 손실(-2.8%). 조건 충족 사실 전달일 뿐 투자 조언 아님.",
+        "⚠️ 2024-06~2025-03 구간에선 상위 30종도 손실(6건 중 1승, -5.3%). 조건 충족 사실 전달일 뿐 투자 조언 아님.",
     ]
     if funnel:
         lines += ["", funnel]
