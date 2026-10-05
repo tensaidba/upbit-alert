@@ -337,6 +337,16 @@ def kst_str(utc_str):
             .astimezone(KST).strftime('%m-%d %H:%M'))
 
 
+def bar_str(utc_str):
+    """A 4h bar as its KST span, e.g. '10-05 13:00~17:00'.
+
+    Upbit stamps a candle with its OPEN time. Messages used to print that stamp
+    as '... 마감', which read four hours early: the '09:00' bar closes at 13:00."""
+    start = datetime.fromisoformat(utc_str).replace(tzinfo=timezone.utc).astimezone(KST)
+    end = start + timedelta(seconds=BAR_SECONDS)
+    return f"{start.strftime('%m-%d %H:%M')}~{end.strftime('%H:%M')}"
+
+
 def fmt_price(p):
     if p >= 1000:
         return f"{p:,.0f}"
@@ -399,14 +409,14 @@ def send_run_ping(btc_bar, regime_ok, scanned, near, cached, funnel='', regime_s
     if regime_ok:
         body = (f"BTC 국면: {regime_status}\n"
                 f"검사 대상: {scanned}종{' (순위 캐시)' if cached else ' (순위 재계산)'}\n"
-                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                f"기준봉: {bar_str(btc_bar)}\n"
                 f"{funnel}\n"
                 f"  스토캐스틱 30돌파 {near['stoch']}건 / MACD 0돌파 {near['macd']}건 / "
                 f"둘 다 같은 봉 {near['both']}건\n\n"
                 f"{watch_lines(watch or [])}")
     else:
         body = (f"BTC 국면: strong_bull 아님 → 종목 스캔 안 함\n"
-                f"기준봉: {kst_str(btc_bar)} 마감")
+                f"기준봉: {bar_str(btc_bar)}")
     return send_telegram(
         f"🧪 스캔 실행 확인 {now.strftime('%m-%d %H:%M')} KST\n\n"
         f"{body}\n\n"
@@ -454,7 +464,7 @@ def main():
             if send_telegram(
                 "📋 업비트 스캐너 일일 점검\n\n"
                 "BTC 국면: strong_bull 아님 → 알림 조건 닫힘\n"
-                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                f"기준봉: {bar_str(btc_bar)}\n"
                 "결과: 국면 필터에서 막혀 종목 스캔 안 함\n\n"
                 "이 메시지가 보이면 알림 경로는 정상입니다.\n"
                 "규칙상 BTC가 강세장일 때만 신호를 찾습니다."):
@@ -601,7 +611,7 @@ def main():
                 f"BTC 국면: {regime_status}\n"
                 f"검사 대상: 원화마켓 {len(ranked)}종 전체 "
                 f"(상위 {UNIVERSE_SIZE}종만 🔔 검증된 신호)\n"
-                f"기준봉: {kst_str(btc_bar)} 마감\n"
+                f"기준봉: {bar_str(btc_bar)}\n"
                 f"결과: {result_status}\n{funnel}\n\n"
                 f"근접 상황 (최근 {CATCHUP_BARS}봉 · {checked}개 조합)\n"
                 f"  스토캐스틱 30돌파 {near['stoch']}건\n"
@@ -620,7 +630,7 @@ def main():
                 f"검사 대상: 원화마켓 {len(ranked)}종 전체 (거래대금 30일 평균 순위)\n"
                 + "".join(f"  {s[ICON]}{s[LEVEL]} {s[RANGE]}: 기대값 {s[EXP]:+.2f}%\n"
                           for s in TIERS)
-                + f"기준봉: {kst_str(btc_bar)} 마감\n"
+                + f"기준봉: {bar_str(btc_bar)}\n"
                 + f"결과: {result_status}\n{funnel}\n\n"
                 + "이 메시지가 보이면 GitHub Actions → 텔레그램 연결이 정상입니다."
             )
@@ -667,15 +677,14 @@ def build_alert(hits, funnel=''):
             for h in group:
                 p = h['price']
                 lines.append(f"{h['market'].replace('KRW-', '')}  {fmt_price(p)}원   "
-                             f"({kst_str(h['bar'])} 봉 · {h['rank']}위)")
+                             f"({bar_str(h['bar'])} 봉 · {h['rank']}위)")
                 lines.append(f"   익절 {fmt_price(p * (1 + TP_PCT / 100))} / "
                              f"손절 {fmt_price(p * (1 - SL_PCT / 100))} / 최대 5일")
-                lines.append(f"   %K {h['k']:.0f} · MA60대비 {h['ma60_gap']:+.1f}%")
         else:
             for h in group[:MAX_REFERENCE_LINES]:
                 lines.append(f"{h['market'].replace('KRW-', '')}  "
                              f"{fmt_price(h['price'])}원  {h['rank']}위 · "
-                             f"{kst_str(h['bar'])} 봉 · MA60 {h['ma60_gap']:+.0f}%")
+                             f"{bar_str(h['bar'])} 봉")
             if len(group) > MAX_REFERENCE_LINES:
                 lines.append(f"   … 외 {len(group) - MAX_REFERENCE_LINES}건 (생략)")
         warn = '' if spec[EXP] > 0 else '  ⚠️ 기대값 마이너스'
